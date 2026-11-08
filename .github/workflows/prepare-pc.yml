@@ -17,6 +17,10 @@ concurrency:
   group: prepare-pc-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # UTF-8 for the tools' files and output on Windows (whose default is the ANSI code page), as pack_android.py runs them (tool_env)
+  PYTHONUTF8: '1'
+
 defaults:
   run:
     shell: bash

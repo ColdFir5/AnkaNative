@@ -46,7 +46,7 @@ micromamba create -p <dump folder>/.venv-anka python=3.14 -c conda-forge
 ```
 
 Capstone comes from pip: conda-forge's Capstone 5 finds its library only through `CONDA_PREFIX`, so it fails when the environment's Python is run without activating it.
-On Windows `pack_android.py` writes every text file with LF line ends (`scripts/lf_newlines.py`), as the phone reads them, and rewrites the code in one process
+On Windows `pack_android.py` runs the tools in UTF-8 mode (`PYTHONUTF8=1`; set it yourself to run one of them directly), writes every text file with LF line ends (`scripts/lf_newlines.py`), as the phone reads them, and rewrites the code in one process
 (Windows has no `fork`); the checkout itself must have LF line ends too (the shader versions and the code's rewrite key hash the repository's files), which `.gitattributes`
 asks of git: a copy cloned on Windows before that rule, or downloaded as a zip and unpacked by a tool that changes line ends, should be cloned again.
 

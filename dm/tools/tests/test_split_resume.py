@@ -117,7 +117,7 @@ class Resume(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.d)), ['digest'])
         reds = [l for l in said.getvalue().splitlines() if l.startswith('[RED] ')]   # a refused class is named, never silent
         self.assertEqual(len(reds), 2, said.getvalue())
-        self.assertTrue(any('posix.system' in l or 'os.system' in l for l in reds), reds); self.assertTrue(any('collections.Counter' in l for l in reds), reds)
+        self.assertTrue(any('posix.system' in l or 'nt.system' in l or 'os.system' in l for l in reds), reds); self.assertTrue(any('collections.Counter' in l for l in reds), reds)
         with self.assertRaises(pickle.UnpicklingError): ss.ResultUnpickler(io.BytesIO(pickle.dumps(os.system))).load()
 
     def test_a_result_type_the_allow_list_lacks_turns_the_cache_off(self):   # checked on the first write: named, nothing kept, the split goes on
