@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the on-device packer's native side (android/ONDEVICE.md) on Linux or a Mac, the stage the APK takes (build.gradle -PnxPackStage=<work dir>/stage):
-#   python: the official CPython 3.14 Android build, Capstone 5 and python-lz4 built with the NDK, and libnxpack.so (dm_pack.c)
+#   python: the official CPython 3.14 Android build, Capstone 5, python-lz4 and zbic built with the NDK, and libnxpack.so (dm_pack.c)
 #   tools:  the translator (dm/gfx/tools/dmsh_xlate_android/build.sh lib: libdmsh_xlate.so, NativeAOT, .NET 10 SDK) and SPIRV-Tools' validator
 #           (build_spirv_tools.sh: libSPIRV-Tools-shared.so), which vk_android_build.py loads through ctypes on the phone
 # Usage: build.sh <work dir> [all|python|tools]   (default all; downloads and intermediate files go into the work dir: put it on the dump drive, not in the home folder)
@@ -31,10 +31,12 @@ if [ "$WHAT" = all ] || [ "$WHAT" = python ]; then
 fetch https://www.python.org/ftp/python/$PYV/python-$PYV-aarch64-linux-android.tar.gz 38bbe77d3167b5cd554e03b1021324926f09f3825202b065951dd7638e9c37e5
 fetch https://files.pythonhosted.org/packages/dd/9c/28b11f64e2425774efb21c206a6e952cfce6e3e2ef3e4b63cdae32ccd8a5/capstone-5.0.7.tar.gz 796bdd69b05fa124fc2aa2e74b9a0b3d4c4e7f3e02add5e583cf2f3bca282ede
 fetch https://files.pythonhosted.org/packages/57/51/f1b86d93029f418033dddf9b9f79c8d2641e7454080478ee2aab5123173e/lz4-4.4.5.tar.gz 5f0b9e53c1e82e88c10d7c180069363980136b9d7a8306c4dca4f760d60c39f0
+fetch https://files.pythonhosted.org/packages/source/z/zbic/zbic-1.0.1.post1.tar.gz a798c24aea58f81a0b4bb0226f0f383b7e7f07a9a0150732cb45dc65ac541ff3
 rm -rf $W/src $W/py; mkdir -p $W/src $W/py
 tar -xzf $W/dl/python-$PYV-aarch64-linux-android.tar.gz -C $W/py
 tar -xzf $W/dl/capstone-5.0.7.tar.gz -C $W/src
 tar -xzf $W/dl/lz4-4.4.5.tar.gz -C $W/src
+tar -xzf $W/dl/zbic-1.0.1.post1.tar.gz -C $W/src
 P=$W/py/prefix; INC=$P/include/python3.14; SFX=cpython-314-aarch64-linux-android.so
 S=$W/stage; rm -rf $S $W/build; mkdir -p $S/lib $S/bin $S/python/lib $W/build
 cp -R $P/lib/python3.14 $S/python/lib/
@@ -55,6 +57,9 @@ cp $L/lz4/block/__init__.py $SP/lz4/block/
 EXT=(-shared -fPIC -O2 "-I$INC" "-I$L/lz4libs" "-L$P/lib" -lpython3.14 -Wl,-z,max-page-size=16384)
 "${CC[@]}" "${EXT[@]}" -o $SP/lz4/_version.$SFX $L/lz4/_version.c $L/lz4libs/lz4.c $L/lz4libs/lz4hc.c
 "${CC[@]}" "${EXT[@]}" -o $SP/lz4/block/_block.$SFX $L/lz4/block/_block.c $L/lz4libs/lz4.c $L/lz4libs/lz4hc.c
+# zbic 1.0.1.post1 (GPLv2): ZBIC, the zstd variant of system 22.0.0+ modules' segments (dm/tools/nso.py), its C extension against the Android Python
+Z=$W/src/zbic-1.0.1.post1/src
+"${CC[@]}" -shared -fPIC -O2 "-ffile-prefix-map=$W/src=/_" "-I$INC" "-I$Z" -DZSTD_ZBIC_SUPPORT=1 "-L$P/lib" -lpython3.14 -Wl,-z,max-page-size=16384 -o $SP/zbic.$SFX $Z/module.c $Z/zstd.c
 # libnxpack.so (dm_pack.c: the C entry and the JNI one, class dev.nxnative.android.PackNative) and the test runner
 cp $P/lib/libpython3.14.so $S/lib/
 "${CC[@]}" -shared -fPIC -O2 -Wall -I$INC -o $S/lib/libnxpack.so $HERE/dm_pack.c -L$P/lib -lpython3.14 -Wl,-z,max-page-size=16384

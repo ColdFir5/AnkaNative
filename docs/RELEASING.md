@@ -90,8 +90,8 @@ verifies it with `apksigner verify --print-certs` (one signer), prints the certi
 (`anka-native-<version>.apk`) and `SHA256SUMS.txt` go to `~/anka-native-releases/<version>/`, outside the repository.
 
 Options (environment): `ANKA_VERSION` (default `0.1.0`) and `ANKA_VERSION_CODE` (default `1`; raise it for every release, Android updates only to a higher
-code), `ANKA_GAMES` (default `0400486024DEC000`; several are comma-separated), `ANKA_PACK_ENGINE` (`fake` by default; `native` needs the on-phone packer's stage,
-`NX_PACK_STAGE`, see [android/README.md](../android/README.md)), `ANKA_RELEASE_DIR` (another folder outside the repository).
+code), `ANKA_GAMES` (default `0400486024DEC000`; several are comma-separated), `ANKA_PACK_ENGINE` (`native` by default, which needs the on-phone packer's stage in
+`NX_PACK_STAGE`, see [android/README.md](../android/README.md); `fake` builds without the packer, and the app then offers no Prepare), `ANKA_RELEASE_DIR` (another folder outside the repository).
 
 ## 5. Publish
 

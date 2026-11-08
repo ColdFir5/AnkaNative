@@ -41,6 +41,13 @@ Anka Native is built on other people's work. This file is where they are credite
   was built with, unmodified from NuGet: Gommon 2.8.1.2 (MIT), Humanizer 3.0.10 with its language resources (MIT), MsgPack.Cli 1.0.1 (Apache-2.0),
   Microsoft.IO.RecyclableMemoryStream 3.0.1 (MIT) and System.CodeDom 4.4.0 (MIT, .NET Foundation); each package's license is in its NuGet package.
 
+- The **on-phone packer** in the APK (`android/ondevice/build.sh` builds it, unmodified from each project's release): **[CPython](https://www.python.org)**
+  3.14.6 for Android (PSF License), **[Capstone](https://github.com/capstone-engine/capstone)** 5.0.7 (BSD-3-Clause),
+  **[python-lz4](https://github.com/python-lz4/python-lz4)** 4.4.5 with LZ4 (BSD-3-Clause, BSD-2-Clause),
+  **[zbic](https://github.com/kinnay/zbic)** 1.0.1.post1 by Yannik Marchand (GPLv2; it carries Zstandard, BSD-3-Clause or GPLv2) for the
+  zstd-compressed code of newer games, **[SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools)** (Apache-2.0) and the
+  **[.NET](https://github.com/dotnet/runtime)** runtime the translator is compiled with (NativeAOT, MIT).
+
 ## Licenses
 
 - The repository's own code is MIT ([LICENSE](LICENSE): seedds' copyright and Anka Native's), except the files marked GPL-3.0-or-later: the frame

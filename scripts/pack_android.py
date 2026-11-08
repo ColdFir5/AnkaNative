@@ -191,7 +191,10 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
         todo[m] = (src, key)
     for m in todo: (out / f'{m}.android.key').unlink(missing_ok=True)   # every module to rewrite is unfinished from here on: no mix of old and new modules passes
     if in_process:
-        for m, (src, key) in todo.items():
+        # progress <done>/<total> <module>: the phone's PackService reads these into the step's bar (the rewrite has no finer progress than its modules)
+        n = len(todo)
+        if n: print(f'progress 0/{n} {next(iter(todo))}', flush=True)
+        for i, (m, (src, key)) in enumerate(todo.items()):
             kf = out / f'{m}.android.key'; kf.unlink(missing_ok=True)
             shutil.rmtree(staging(out, m), ignore_errors=True)
             print(f'  {m}: rewriting {src} (in process)', flush=True)
@@ -202,6 +205,7 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
                 raise Error(f'patch_nso.py exit code {rc} on {m}:\n' + '\n'.join(tail))
             swap_in(out, m, key)
             print(f'  {m}: done ({time.monotonic() - t0:.1f} s)', flush=True)
+            print(f'progress {i + 1}/{n} {m}', flush=True)
         return
     procs = {}
     try:

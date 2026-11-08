@@ -2978,6 +2978,8 @@ def main():
     if len(romfs_v) != len(main_v): red(f'{len(romfs_v)} RomFS and {len(main_v)} main: they must pair one to one')
     files, results, common, dumps = [], [], None, []
     for i, (romfs, mainnso) in enumerate(zip(romfs_v, main_v)):
+        # before the file count is known (the RomFS listing, main's decompression and scan take minutes on a phone): a stage line so the step does not look stuck
+        print(f'progress: {i}/{len(romfs_v)} main', flush=True)
         tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
         files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
         img = nso_image(mainnso)

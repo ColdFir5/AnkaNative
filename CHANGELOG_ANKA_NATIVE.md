@@ -5,6 +5,18 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
+## Anka Native 0.2.0
+
+- **Prepare on the phone.** The APK now carries the real on-phone packer (CPython 3.14 with the repository's tools, the shader translator
+  `libdmsh_xlate.so` and SPIRV-Tools), so Add game › Prepare makes a game's pack from the dump on the phone itself. Experimental: on the POCO F8 Pro
+  with Ocarina of Time, the code rewrite took about 3 minutes and the shader scan of the game's 186,583 files about 30; the shader translation was
+  still being tested when this was released.
+- The packer's build (`android/ondevice/build.sh`, `dm/gfx/tools/dmsh_xlate_android/build.sh`, `build_spirv_tools.sh`) runs with bash on Linux as well
+  as on the Mac, and adds **zbic**: the zstd-compressed (ZBIC) code segments of system 22.0.0+ games, which Ocarina of Time has, need it to be read.
+- The code rewrite and the shader scan report progress from their start (a module count; a stage line before the file count is known), so the
+  step no longer sits at 0 for minutes.
+- `android/tools/release.sh` builds with the real packer by default (`ANKA_PACK_ENGINE=native`, the stage from `NX_PACK_STAGE`).
+
 ## Anka Native 0.1.1
 
 - **Prepare on the phone looked done but made nothing to play.** 0.1.0 was built without the on-phone packer (`-PnxPackEngine=fake`), so its
