@@ -76,7 +76,7 @@ jobs:
       - name: Packer unit tests
         run: |
           for t in dm/tools/tests/test_pack_android.py dm/tools/tests/test_split_*.py; do
-            echo "== $t"; python -m unittest "$t" 2>&1 | tail -3
-            python -m unittest "$t" > /dev/null 2>&1 || fails="$fails $t"
+            echo "== $t"
+            if python -m unittest "$t" > test.log 2>&1; then tail -2 test.log; else cat test.log; fails="$fails $t"; fi
           done
           [ -z "$fails" ] || { echo "failed:$fails"; exit 1; }
