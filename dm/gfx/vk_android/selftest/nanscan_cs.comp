@@ -1,0 +1,37 @@
+#version 450
+// DM_VK_NANSCAN_CS (vka_nanscan.c): one level 0 layer of an image a chosen compute dispatch binds (a storage image it writes or a texture it samples), read as float: counts its
+// NaN and infinite texels and keeps the first one's position, and for the finite ones counts the all-zero texels (RGB 0) and those with a component of 256 or more ("big",
+// the first one's position kept) and keeps the largest component. A workgroup sums in shared memory, then adds once into the result
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2DArray img;
+layout(set = 0, binding = 1) buffer O { uint nan; uint inf; uint first; uint zero; uint maxv; uint big; uint fbig; uint pad; } o;
+layout(push_constant) uniform P { uvec2 size; uint layer; uint pad; } pc;
+shared uint s_nan, s_inf, s_first, s_zero, s_max, s_big, s_fbig;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) { s_nan = 0u; s_inf = 0u; s_first = 0xffffffffu; s_zero = 0u; s_max = 0u; s_big = 0u; s_fbig = 0xffffffffu; }
+    barrier();
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x < pc.size.x && p.y < pc.size.y) {
+        vec4 v = texelFetch(img, ivec3(p, pc.layer), 0);
+        bool n = any(isnan(v)), i = any(isinf(v));
+        uint at = p.y << 16 | p.x;
+        if (n) atomicAdd(s_nan, 1u);
+        if (i) atomicAdd(s_inf, 1u);
+        if (n || i) atomicMin(s_first, at);
+        else {
+            float m = max(max(v.r, v.g), v.b);   // (non-negative floats order as their bits)
+            if (m > 0.0) atomicMax(s_max, floatBitsToUint(m));
+            if (v.r == 0.0 && v.g == 0.0 && v.b == 0.0) atomicAdd(s_zero, 1u);
+            if (m >= 256.0) { atomicAdd(s_big, 1u); atomicMin(s_fbig, at); }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (s_nan != 0u) atomicAdd(o.nan, s_nan);
+        if (s_inf != 0u) atomicAdd(o.inf, s_inf);
+        if (s_first != 0xffffffffu) atomicMin(o.first, s_first);
+        if (s_zero != 0u) atomicAdd(o.zero, s_zero);
+        if (s_max != 0u) atomicMax(o.maxv, s_max);
+        if (s_big != 0u) { atomicAdd(o.big, s_big); atomicMin(o.fbig, s_fbig); }
+    }
+}

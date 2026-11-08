@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions, ideas and phone reports that work
+    url: https://github.com/EddizEge/AnkaNative/discussions
+    about: Ask, suggest a game or a feature, or tell which phone and driver it runs on. Issues are for problems, with the form.
+  - name: Install and use
+    url: https://github.com/EddizEge/AnkaNative#readme
+    about: What you need, the games and versions that run, and how to add a game.

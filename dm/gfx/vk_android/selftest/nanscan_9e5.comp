@@ -1,0 +1,30 @@
+#version 450
+// DM_VK_NANSCAN_CS (vka_nanscan.c): nanscan_cs.comp for an R32_UINT image that holds RGB9E5 words (a frame packed through an R32_UINT storage view): each word decoded as
+// VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 (R bits 0-8, G 9-17, B 18-26, shared exponent 27-31, bias 15, value = mantissa * 2^(exponent - 24)). RGB9E5 has no NaN or infinity, so
+// only the all-zero, big (a component of 256 or more) and largest-component results mean anything; nan and inf stay 0
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform usampler2DArray img;
+layout(set = 0, binding = 1) buffer O { uint nan; uint inf; uint first; uint zero; uint maxv; uint big; uint fbig; uint pad; } o;
+layout(push_constant) uniform P { uvec2 size; uint layer; uint pad; } pc;
+shared uint s_zero, s_max, s_big, s_fbig;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) { s_zero = 0u; s_max = 0u; s_big = 0u; s_fbig = 0xffffffffu; }
+    barrier();
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x < pc.size.x && p.y < pc.size.y) {
+        uint w = texelFetch(img, ivec3(p, pc.layer), 0).r;
+        int e = int(w >> 27) - 24;
+        vec3 v = vec3(float(w & 511u), float(w >> 9 & 511u), float(w >> 18 & 511u));
+        v = vec3(ldexp(v.r, e), ldexp(v.g, e), ldexp(v.b, e));
+        float m = max(max(v.r, v.g), v.b);
+        if (m > 0.0) atomicMax(s_max, floatBitsToUint(m));
+        else atomicAdd(s_zero, 1u);
+        if (m >= 256.0) { atomicAdd(s_big, 1u); atomicMin(s_fbig, p.y << 16 | p.x); }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (s_zero != 0u) atomicAdd(o.zero, s_zero);
+        if (s_max != 0u) atomicMax(o.maxv, s_max);
+        if (s_big != 0u) { atomicAdd(o.big, s_big); atomicMin(o.fbig, s_fbig); }
+    }
+}

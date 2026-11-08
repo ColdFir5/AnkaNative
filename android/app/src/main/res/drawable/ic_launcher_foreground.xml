@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Anka mark (drawable-<density>/anka_fg.png, written by android/tools/anka_icons.py; inside the 66 dp safe circle) and the variant's badge (src/variant-test or src/variant-play, picked in build.gradle) -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@drawable/anka_fg" />
+    <item android:drawable="@drawable/ic_launcher_badge" />
+</layer-list>

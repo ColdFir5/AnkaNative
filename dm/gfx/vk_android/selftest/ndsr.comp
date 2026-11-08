@@ -1,0 +1,23 @@
+#version 450
+// DM_VK_NDSR_STANDIN (vka_draw.c ndsr_standin): stands in for agl's NDSR upscaler network d99fbeeb53d38847. Its input holds the square root of the tonemapped frame; each texel
+// of its output is that input sampled bilinearly at the texel's place, squared. The place follows d99's own constants (its uniform buffer, mode 1): the texel at output origin
+// c[1].xy (integer bits) + p reads UV (p + 0.5) * c[6].zw, p below the network's extent c[6].xy (integer bits: its write guard) and within the dispatch's groups times the
+// workgroup tile c[4].zw (integer bits); without them (mode 0) the whole input over the whole output. The network adds detail on top of that bilinear term; the stand-in leaves it out
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1) writeonly uniform image2D dst;
+layout(set = 0, binding = 2, std140) uniform K { vec4 c[7]; } k;
+layout(push_constant) uniform P { uvec2 groups; uint mode; uint pad; } pc;
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy), size = imageSize(dst);
+    if (any(greaterThanEqual(o, size))) return;
+    vec2 uv;
+    if (pc.mode != 0u) {
+        ivec2 p = o - floatBitsToInt(k.c[1].xy), tile = floatBitsToInt(k.c[4].zw), ext = floatBitsToInt(k.c[6].xy);
+        if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ext))) return;
+        if (tile.x > 0 && tile.y > 0 && any(greaterThanEqual(p, ivec2(pc.groups) * tile))) return;
+        uv = (vec2(p) + 0.5) * k.c[6].zw;
+    } else uv = (vec2(o) + 0.5) / vec2(size);
+    vec3 v = textureLod(src, uv, 0.0).rgb;
+    imageStore(dst, o, vec4(v * v, 1.0));
+}

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark mode: the Anka tile's warm night with the same fire colours -->
+    <color name="bn_bg">#FF160A08</color>
+    <color name="bn_card">#FF241210</color>
+    <color name="bn_card_stroke">#FF3E1E18</color>
+    <color name="bn_tint">#FF3E1D12</color>
+    <color name="bn_banana">#FFFFA43C</color>
+    <color name="bn_banana_deep">#FFFF7A2A</color>
+    <color name="bn_on_banana">#FF3A1210</color>
+    <color name="bn_text">#FFFFEBDD</color>
+    <color name="bn_text_2">#FFD2A88E</color>
+    <color name="bn_accent">#FFFFB24A</color>
+    <color name="bn_leaf">#FF7FC79A</color>
+    <color name="bn_on_leaf">#FF10241A</color>
+    <color name="bn_danger">#FFFF8A6A</color>
+    <color name="bn_danger_tint">#FF3D1A14</color>
+    <color name="bn_warn_tint">#FF422414</color>
+</resources>

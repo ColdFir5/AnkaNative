@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The icon's tile colour (the Anka mark's dark warm tile, android/tools/anka_logo.py TILE_TOP) -->
+    <color name="ic_launcher_background">#FF3A1210</color>
+
+    <!-- The launcher's palette (Ui.java, themes.xml), in the Anka mark's colours: fire gold and orange on warm ivory, a green kept for "ready". values-night has the
+         dark set. The names (bn_*) are the original launcher's; bn_banana is the primary (fire orange) -->
+    <color name="bn_bg">#FFFFF4EC</color>            <!-- the screen: warm ivory -->
+    <color name="bn_card">#FFFFFCF8</color>          <!-- cards and dialogs -->
+    <color name="bn_card_stroke">#FFF3D3C0</color>
+    <color name="bn_tint">#FFFFE6D2</color>          <!-- tonal buttons, icon tiles, chips -->
+    <color name="bn_banana">#FFFF9224</color>        <!-- primary buttons: fire orange -->
+    <color name="bn_banana_deep">#FFE2541E</color>
+    <color name="bn_on_banana">#FF3A1210</color>     <!-- text on the primary (both modes) -->
+    <color name="bn_text">#FF3A1A12</color>
+    <color name="bn_text_2">#FF7A4E3C</color>
+    <color name="bn_accent">#FFB8461A</color>        <!-- check boxes, switches, dialog buttons: a deep ember that reads on ivory -->
+    <color name="bn_leaf">#FF1E5B3A</color>
+    <color name="bn_on_leaf">#FFFFF6E0</color>
+    <color name="bn_danger">#FFB0281A</color>
+    <color name="bn_danger_tint">#FFFDE0D8</color>
+    <color name="bn_warn_tint">#FFFFE2C2</color>
+</resources>

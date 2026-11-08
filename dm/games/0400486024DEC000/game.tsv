@@ -1,0 +1,112 @@
+# The Legend of Zelda: Ocarina of Time (Switch 2, update v131072). In bring-up: provisional profile, not yet booted
+# Nintendo EPD's engine (sead / agl / gsys, Phive, Havok), SDK 22 built for the Switch 2 (spec Ounce), NVN2; modules main + subsdk0 (NintendoSDK movie) + sdk.
+# Packed from a .nup (base v65536, update v131072; android/NUP.md). Shaders: Shader/*.Nin_Ounce_NVN2.bfsha.zs and Layout2Shader/*.bfsha.zs (BNSH with Ampere code).
+
+# ---- Identity ----
+title_id	0400486024DEC000
+program_id	0400486024DEC000
+
+# ---- App ----
+name	The Legend of Zelda: Ocarina of Time
+ipa	ZeldaOcarinaOfTime.ipa
+app_category	public.app-category.adventure-games
+pad_layout	full
+
+# ---- Versions ----
+build	v131072	v131072	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+# subsdk0 is NintendoSDK movie (824 exports); main imports its movie player (nn::movie), which the host does not supply, so it is loaded (as Mario Kart World's)
+modules	main subsdk0 sdk
+romfs_marker	System/Resource/ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs
+zip_store	.zs:.bwav:.webm:.metallib
+
+# ---- Memory ----
+# The NPDM declares 48 MB of system resource (virtual address memory on) and main sets a heap, as Mario Kart World: its layout is taken over (not measured on this game).
+# The Mac heap check that sizes these was not run (no Mac); the phone log's SetHeapSize lines (profile_guess.heap_signals) are to correct them.
+# The Switch 2's 9 GB pool (as Donkey Kong Bananza; not measured)
+mem_reserve	0x300000000
+mem_alias	0x100000000
+mem_stack	0x10000000
+app_pool	0x240000000
+sys_resource	0x3000000
+# A map past the application pool fails with ResultLimitReached, as on Horizon: the SDK's allocator keeps freed pages mapped until a map fails, then gives them back
+# (upstream nxnative's profile for this game, its PR 1444)
+mem_map_limit	on
+
+# ---- Shader split (shader_split.py) ----
+# As Tears of the Kingdom (the same engine family): ApplicationPackage holds the layout shaders; Layout2Shader/ holds the UI's MergeShader
+shader_groups	/Shader/ApplicationPackage=layout /Shader/=shader /Effect/=effect /UI/=layout /Layout2Shader/=layout
+shader_note	The Legend of Zelda: Ocarina of Time shaders
+
+# ---- Frame rate ----
+# The game steps its time by a frame ratio, base rate / its int frame rate, whatever the frame took (main+0x6e6cc4): at 15 fps it played at 25 % speed (session-2026-11-07
+# play/PLAY.md section 3). The ratio takes the host's frame step instead (FRAME_STEP in patches.py, ported from seedds/nxnative 7d8dcdf8): 1 vsync at 60 fps, up to 3 when 60
+# does not hold (nvn_fstep.h FSTEP_MAX), so game time = real time down to 20 fps; below that it runs at 3 vsyncs a frame (12 fps: 60 % speed instead of 20 %)
+fps_target	60
+
+# ---- Graphics ----
+# agl's render buffer binding (Donkey Kong Bananza, Tears of the Kingdom): the same engine, not yet checked on this game
+render_cond	on
+# The game's dynamic resolution decides from GPU timestamps (upstream nxnative's profile)
+gpu_timestamps	segment
+# The CPU writes some textures after creating them, published with and without a flush (upstream nxnative's profile: the terrain's height, blend and hole maps)
+tex_flush_upload	on
+tex_dirty_upload	on
+
+# ---- Host switches ----
+# Android switches every run starts with (main.c env_defaults; env.txt or the environment wins). The runs that reached gameplay had them, those without were ended by the
+# low-memory killer in the first scene load (session-2026-11-07 t3/t4/m1/nA/nA2): pools of 64 MiB and more placed by 16 MiB parts (the 305/149/88 MiB texture pools are under
+# the default 1024 and were placed whole: the 305 MiB one had 16 MiB placed), and two threads making the pipelines the frame misses (fragment shaders of 13-29 s on Mesa main)
+# Scratch: 16 MiB of idle scratch blocks kept and 64 MiB of upload staging in flight (defaults 64 / 256): c4/c4b were killed at the Deku Tree cutscene's next shot with
+# 80-112 MiB of scratch (session-2026-11-07 kill/ANALYSIS.md); both are host-visible device memory the low-memory killer counts, and both switches are live (ctl env)
+# Mip drop: under memory pressure (MemAvailable under 1 GB, which this game reaches 15 s into play) tracked block-compressed textures are made without their finest level,
+# and idle ones shrunk (vka_tex.c "Mip drop"): the Deku Tree → Kokiri Forest load made ~830 guest textures (390-436 MiB) in 8 s and was killed every time (forest/ANALYSIS.md).
+# Blurrier textures under pressure; DM_VK_MIPDROP=0 (live) turns it off
+# Texture-use feedback (vka_tex.c "Texture-use feedback"), the gate under memory pressure: a library whose shaders report the texture IDs they index (DMSH_VK_F_TEXFB)
+# has a pool scan's deferred IDs made only when the GPU indexed them lately (others on a grey placeholder until a readback asks), and named images no draw indexed let go
+# (DM_VK_TEXFB_IDLE_READBACKS / _FRAMES). Step 0 (fb0) showed every pool shader reporting and no blind draw; the gated run (fb1) was the first through the Kokiri Forest
+# load (peak 3007 MiB host total, against 3607 killed) with every surface textured (session-2026-11-07 fb/FB.md, REL.md). An older library reports nothing: as before.
+# DM_VK_TEXFB=1 (env.txt, restart) logs only, 0 off
+# Loading the Kokiri Forest save from the title (fb3, session-2026-11-07 fb/SAVELOAD.md) was killed in the load: MemAvailable 2.7 → 0.66 GB in 20 s, the 1 GB line 3 s before
+# the end. Pressure from the rate (DM_VK_PRESS_RATE: under 2 GB and falling 400 MiB in 5 s, or 384 MiB of images made in 5 s) turns mip drop, coarse-first and the gate on
+# earlier. Its 12288² DEPTH16 target (299 MiB, alone in its zero-shared allocation) took a second 299 MiB at its first write: DM_VK_ZSHARE_ADOPT gives it that allocation
+# instead, DM_VK_ZSHARE_ZCLEAR leaves a clear to zero of a zero-shared image out (exact: zeros onto zeros), DM_VK_RTWATCH_MB=32 logs what reaches GPU-content images of 32 MiB+
+# Walking in Link's house its DEPTH32F target at one pool address takes a new size almost every frame (1112² to 1482²): each size was an image with memory of its own,
+# +345 MiB in 110 frames, killed 20 s into the walk (session-2026-11-07 rt/FB6.md). DM_VK_RTALIAS binds the images over one storage start that differ only in extent to one
+# allocation (vka_tex.c "Guest-aliased targets"; same bytes on the Switch). In the forest (fb7, rt/FB7.md) its sizes are 477² to 981² (0.9-3.7 MiB), under the default
+# 4 MiB, and grew to 304 MiB: DM_VK_RTALIAS_MB=1 takes them (an allocation under 4 MiB is a run of an image memory block, not a VkDeviceMemory of its own)
+# DM_MEM_FOOT=1: `[mem] foot` lines every 30 s (hle_svc.c "Guest memory footprint"): which guest regions and pools are resident or swapped, what the host still reads of
+# each pool, major page faults (fb7: ~4.2 GB of the process's 8.58 GB PSS was guest memory, 4.61 GB of it swapped, ~2300 major faults a frame in the forest)
+# Shader-code pools (hle_nvn.c "Shader-code pools"): fb8 had 205 SHADER_CODE pools, 345 MiB, all placed (unswappable driver memory; pool 79 alone 244 MiB) though the GPU
+# never reads shader code. DM_VK_PLACE_SHADER_POOLS=0 places them only for a command naming an address in them or a texture over them; DM_VK_SHPOOL_LOG=1 lists every use
+# per pool and kind, so a data use in them shows (session-2026-11-07 fps/IMPL.md)
+# Not placed, those 344 MiB went to zram instead (fb9: KGSL -0.35 GB, zram +0.25 GB). DM_MEM_FILEBACK=1 with DM_MEM_FILEBACK_KINDS=shader makes the shader-code pools a shared
+# mapping of an unlinked file in the app's cache folder (vka_mem.c "File-backed pools"): clean file pages the kernel drops, not zram. Texture pools ("shader,texture",
+# ~2 GB of flash writes per area load) only when the user chooses it (session-2026-11-07 lights/IMPL.md)
+# Page index buffers (vka_draw.c gmem_pidx, library v-fc7819d73925 on): each holds the pool table and the window's records, 20.7 MiB here. fb12 (session-2026-11-07
+# pidx/FB12.md) with the default 4: 15 waits for a buffer (300.6 ms) and 21 in-place updates, all in the forest load (289 of 294 updates); in 15 min of play 5 updates, minutes
+# apart, 0 waits. A new generation waits only when the other buffer's last submission is still on the GPU, i.e. for two generations in consecutive submissions, which play
+# did not have: DM_VK_GMEM_PIDX_BUFS=2 gives back 41.4 MiB of device memory; the load's waits may grow (the [reach] line counts them)
+# day2 (session-2026-11-07 day2/IMPL.md): DM_FSTEP_LOG_S=10 a frame-step line every 10 s (the step per frame, game time against real time). DM_VK_PCACHE_MIN_S=120: the
+# pipeline cache file saved at most every 2 minutes, never during a burst, cache hits not counted (the play run wrote 216 full saves, 34.6 GB, in 3 minutes; fb13's walk stalls
+# overlapped saves); at once at suspend and at the end. DM_VK_PSO_TRY=2: the frame path's cache-only try only for keys an earlier run made (fb13: 15 misses, 8.7 s of frame time).
+# Pop-in (play/PLAY.md section 2, the user chose to keep textures longer at some RAM cost): DM_VK_TEXFB_IDLE_S=30 lets an image go only after 30 s with no GPU index (2 s under
+# 1 GB MemAvailable or a fast fall, as kills came at 0.5-0.7 GB; 66 % of the 2 s releases were made again within 30 s), DM_VK_TEXFB_REPORT_MB=128 makes GPU-indexed textures at full size before the next draw within 128 MiB
+# a frame (seedds/nxnative's budget), DM_VK_MIPDROP_RESTORE_MB=32 makes mip-dropped images in use whole again, 32 MiB a second, once the pressure has been off 15 s and
+# MemAvailable is at least 1.5 GB
+# DM_VK_PRESS_HYST_MB=256: the pressure ends only above 1280 MiB MemAvailable and after 5 s with no test holding it (DM_VK_PRESS_OFF_S); the walk sat at 0.98-1.12 GB and each
+# end made 2.2-3.9k textures in a 1.4-3.2 s frame, which turned it on again within 1 s (session-2026-11-07 day2/D2.md section 3, aa/IMPL.md)
+# DM_VK_PRESS_OFF_MB=64: the IDs the feedback gate held back are made at most 64 MiB a frame once it turns off (the aa run's two ends made 4.4k textures, 640 MB, in a 2.5 s frame).
+# DM_VK_NDSR_STANDIN_AA=1: the NDSR stand-in reads the image the game's AA blend (a335c1db6270c355) wrote in this frame, and logs whether that is its input (session-2026-11-07
+# aa/WIRE.md). DM_VK_LOD_BIAS_MIN stays off here: the phone run A/Bs it
+host_env	DM_VK_PLACE_PART_MB=64 DM_VK_PSO_ASYNC=2 DM_VK_NDSR_STANDIN=1 DM_VK_SCRATCH_IDLE_MB=16 DM_VK_UPLOAD_INFLIGHT_MB=64 DM_VK_MIPDROP=1 DM_VK_SCAN_COARSE=1 DM_VK_TEXFB=2 DM_VK_PRESS_RATE=1 DM_VK_ZSHARE_ADOPT=1 DM_VK_ZSHARE_ZCLEAR=1 DM_VK_RTWATCH_MB=32 DM_VK_RTALIAS=1 DM_VK_RTALIAS_MB=1 DM_MEM_FOOT=1 DM_VK_PLACE_SHADER_POOLS=0 DM_VK_SHPOOL_LOG=1 DM_MEM_FILEBACK=1 DM_MEM_FILEBACK_KINDS=shader DM_VK_GMEM_PIDX_BUFS=2 DM_FSTEP_LOG_S=10 DM_VK_PCACHE_MIN_S=120 DM_VK_PSO_TRY=2 DM_VK_TEXFB_IDLE_S=30 DM_VK_TEXFB_REPORT_MB=128 DM_VK_MIPDROP_RESTORE_MB=32 DM_VK_PRESS_HYST_MB=256 DM_VK_PRESS_OFF_MB=64 DM_VK_NDSR_STANDIN_AA=1
+
+# ---- Test runs ----
+# DM_SKIP's intro skip (android/TESTING.md, Intro skip) turns itself off at gameplay: the opening and title movies draw 2-16 draws a frame, the new-game movie 2-6, the first
+# scene in Kokiri Forest 647-1,010 (j3 log, 2026-11-07); its presses go on 10 s more, through the first dialogue (it ends about 8 s after the first 3D frame)
+skip_until_draws	500 10
+# DM_FASTBOOT=1: the intro skip from the start (A every 12 presented frames, movies ended early) and a [mark] at the first gameplay frames
+fastboot_env	DM_SKIP=auto DM_MARK_DRAWS=500
