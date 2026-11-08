@@ -27,7 +27,8 @@ The first release: Ocarina of Time (the Switch 2 remake, `0400486024DEC000`) bro
 - About: the app names its license, GPL-3.0-or-later as a whole, and points to NOTICE.md; logs and the Vulkan application name say "Anka Native".
 - Release signing: `-PnxLive=true` reads the key from `ANKA_KEYSTORE`, `ANKA_KEY_ALIAS`, `ANKA_KEYSTORE_PASSWORD` and `ANKA_KEY_PASSWORD` (environment
   or `~/.gradle/gradle.properties`); `android/tools/release.sh` builds, signs, verifies and checksums a release ([docs/RELEASING.md](docs/RELEASING.md)).
-  `Signer.OFFICIAL` is not set until the owner's key exists, so no build calls itself official yet.
+  `Signer.OFFICIAL` holds the release certificate's SHA-256 (`4d7443354f53…3bb0`, CN=EddizEge), so only builds signed with that key call
+  themselves official.
 - APK names `anka-native-<suffix>.apk`; exported packs `anka-pack-<title ID>-<version>.zip`; the in-app updater looks at this project's releases.
 - Game settings > **RAM saver (uses storage)**, per game, off by default: the game's large write-once texture pools live in a file in the app's cache
   folder instead of in RAM (`DM_MEM_FILEBACK=1`, `DM_MEM_FILEBACK_KINDS=shader,texture`). For phones short of RAM with free storage: in Ocarina of Time

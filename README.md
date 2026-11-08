@@ -67,7 +67,7 @@ What changed, with more numbers: [CHANGELOG_ANKA_NATIVE.md](CHANGELOG_ANKA_NATIV
 
 ## Download and check
 
-The release has the APK (`anka-native-oot.apk` for Ocarina of Time) and `SHA256SUMS.txt`. To check a download on a computer:
+The release has the APK (`anka-native-<version>.apk`, app id `dev.ankanative.android`) and `SHA256SUMS.txt`. To check a download on a computer:
 `sha256sum -c SHA256SUMS.txt --ignore-missing` (on a Mac: `shasum -a 256 -c SHA256SUMS.txt`). Only download the app from this
 repository's Releases: a copy from anywhere else may be modified.
 
