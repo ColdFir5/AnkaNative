@@ -7,6 +7,13 @@ The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
 ## Unreleased
 
+- **Prepare on the phone stopped at the end for Ocarina of Time** ([#3](https://github.com/EddizEge/AnkaNative/issues/3)): "76 of 42346 shaders did
+  not build: no library written". The same 76 do not build on a computer either (74 that SPIRV-Tools refuses, "Vector access is out of bounds"; a
+  mesh program without a mesh layout; Ampere instruction 481), and the game plays without them. The phone's job writes a library only when every
+  shader that builds on a computer built, and learns which ones do not from the profile's manifest, which Ocarina of Time did not have yet. Its
+  manifest is now in the profile (`dm/games/0400486024DEC000/vk_delta.tsv`, `--publish-delta` from the full Linux build of `v-0dd4341ae6ce`). Checked
+  on Linux with the phone's rule (`DMSH_VK_REQUIRE_ALL=1`): without the manifest the build stops with the issue's message; with it, the library is
+  written, byte for byte the one the computer's build made. Retry on the phone translates only the 76 again and then finishes.
 - **Preparing on Windows and Linux.** `scripts/pack_android.py` runs on Windows, Linux and the Mac (android/README.md, The environment):
   - the shader translator starts through a launcher beside `dmsh_xlate.dll` for each system (`dmsh_xlate-<linux|win>-<x64|arm64>`, .NET apphosts of the
     same translator); the committed `dmsh_xlate` is the Mac's. Checked on Linux: 75 Ocarina of Time shaders translate byte for byte as with the
