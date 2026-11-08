@@ -21,7 +21,7 @@ final class Signer {
     // While it is NOT_SET no APK counts as official: the play and release apps end their build tag with "unofficial build".
     // ======================================================================================================================================================
     /** SHA-256 of the release signing certificate (DER), lower-case hex, as apksigner verify --print-certs prints it (public data); {@link #NOT_SET} until it exists */
-    static final String OFFICIAL = NOT_SET;
+    static final String OFFICIAL = "4d7443354f53a0aef11bc4df1a34ff3fc5bd6d748bbeb76fd78c80a6841f3bb0";
 
     private Signer() {}
 
