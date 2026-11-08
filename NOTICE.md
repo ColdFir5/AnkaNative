@@ -40,6 +40,7 @@ Anka Native is built on other people's work. This file is where they are credite
   the translator `dm/gfx/tools/dmsh_xlate_bin` (a GPL-3.0-or-later combined work, see above). The translator folder also carries the .NET packages it
   was built with, unmodified from NuGet: Gommon 2.8.1.2 (MIT), Humanizer 3.0.10 with its language resources (MIT), MsgPack.Cli 1.0.1 (Apache-2.0),
   Microsoft.IO.RecyclableMemoryStream 3.0.1 (MIT) and System.CodeDom 4.4.0 (MIT, .NET Foundation); each package's license is in its NuGet package.
+  Beside it, `dmsh_xlate-<linux|win>-<x64|arm64>` are .NET's application hosts (MIT) that start the same translator on Linux and Windows.
 
 - The **on-phone packer** in the APK (`android/ondevice/build.sh` builds it, unmodified from each project's release): **[CPython](https://www.python.org)**
   3.14.6 for Android (PSF License), **[Capstone](https://github.com/capstone-engine/capstone)** 5.0.7 (BSD-3-Clause),

@@ -59,7 +59,7 @@ What changed, with more numbers: [CHANGELOG_ANKA_NATIVE.md](CHANGELOG_ANKA_NATIV
   says whether yours has it.
 - **Your own game dump**, of a game you legally own: a `.nup` file or a dump folder (`base/` with `exefs/` and `romfs/`, and
   `updates/<version>/` if any). NSP and XCI files do not work for Switch 2 games. No keys or firmware are needed.
-- Time to prepare the game once (see "Install"): on the phone itself (new in 0.2.0, experimental), or on a computer (Linux or Mac).
+- Time to prepare the game once (see "Install"): on the phone itself (new in 0.2.0, experimental), or on a computer (Windows, Linux or Mac).
 - Free storage on the phone: the prepared game (the pack, with its shader library) is a few hundred MB to a few GB; the RAM saver writes
   about 2 GB per area load.
 - Optional: your own `Lossless.dll` from Lossless Scaling for Windows, for frame generation (never included).
@@ -79,7 +79,7 @@ This is an experimental build with no warranty ([LICENSE](LICENSE)).
 the background, with a notification (keep the phone charging: it takes a long time, over an hour for Ocarina of Time). When it is done,
 the game's card says Ready; tap **Play**. If anything fails, the card says why and keeps its log; preparing on a computer still works.
 
-**On a computer:**
+**On a computer** (Windows, Linux or Mac):
 
 1. **Prepare the game on a computer**, once: make the environment and run `scripts/pack_android.py` on your dump, as
    [android/README.md](android/README.md#the-environment) describes ([Pack a game](android/README.md#pack-a-game)). It rewrites the

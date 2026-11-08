@@ -1,0 +1,5 @@
+# Every text file is checked out with LF on every system, Windows too: the shader chain versions (dmsh_chain.py, vk_android_build.py --digest), the
+# rewrite key and the shader inputs digest hash files of this repository byte for byte, and the phone reads the tables the tools write with LF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

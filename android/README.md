@@ -13,20 +13,50 @@ The Android port of the host: one launcher APK (`android/app`) that holds the ho
 
 ## The environment
 
-The packer runs the rewriter, which needs Capstone 5 and lz4 (`pyproject.toml`, dependency group `android-pack`). Keep the environment on the dump drive, not in the home folder:
+Preparing a game on a computer works on Windows, Linux and the Mac. It needs:
+
+- **Python 3.14** with Capstone 5, lz4 and zbic (`pyproject.toml`, dependency group `android-pack`; zbic reads the zstd-compressed code of system 22.0.0+
+  games such as Ocarina of Time).
+- The **.NET 10 runtime**, which runs the committed shader translator (`dm/gfx/tools/dmsh_xlate_bin`). On the Mac it starts as `dmsh_xlate`; on Linux and
+  Windows `pack_android.py` starts it through the launcher beside it, `dmsh_xlate-<linux|win>-<x64|arm64>`.
+- **spirv-val** (SPIRV-Tools) on the `PATH`.
+
+Keep the environment on the dump drive, not in the home folder.
+
+Windows (PowerShell; Python from python.org, .NET from https://dotnet.microsoft.com/download/dotnet/10.0, spirv-val from the Vulkan SDK at
+https://vulkan.lunarg.com, whose installer puts its `Bin` folder on the `PATH`):
+
+```powershell
+py -3.14 -m venv D:\Switch2\.venv-anka
+D:\Switch2\.venv-anka\Scripts\python -m pip install "capstone>=5,<6" lz4 zbic
+```
+
+Linux (the distribution's `dotnet-runtime-10.0` and `spirv-tools` packages; Python 3.14 from the distribution or micromamba):
 
 ```sh
-micromamba create -p <dump folder>/.venv-nxnative python=3.12 -c conda-forge
-<dump folder>/.venv-nxnative/bin/python -m pip install "capstone>=5,<6" lz4
+python3.14 -m venv <dump folder>/.venv-anka
+<dump folder>/.venv-anka/bin/python -m pip install "capstone>=5,<6" lz4 zbic
+```
+
+The Mac (`brew install --cask dotnet-sdk`, `brew install spirv-tools`):
+
+```sh
+micromamba create -p <dump folder>/.venv-anka python=3.14 -c conda-forge
+<dump folder>/.venv-anka/bin/python -m pip install "capstone>=5,<6" lz4 zbic
 ```
 
 Capstone comes from pip: conda-forge's Capstone 5 finds its library only through `CONDA_PREFIX`, so it fails when the environment's Python is run without activating it.
+On Windows `pack_android.py` writes every text file with LF line ends (`scripts/lf_newlines.py`), as the phone reads them, and rewrites the code in one process
+(Windows has no `fork`); the checkout itself must have LF line ends too (the shader versions and the code's rewrite key hash the repository's files), which `.gitattributes`
+asks of git: a copy cloned on Windows before that rule, or downloaded as a zip and unpacked by a tool that changes line ends, should be cloned again.
 
 ## Pack a game
 
 ```sh
-<dump folder>/.venv-nxnative/bin/python scripts/pack_android.py <dump folder>/<game folder>
+<dump folder>/.venv-anka/bin/python scripts/pack_android.py <dump folder>/<game folder or .nup>
 ```
+
+On Windows: `D:\Switch2\.venv-anka\Scripts\python scripts\pack_android.py "D:\Switch2\<game>.nup"`.
 
 The game folder has the layout `scripts/pack_dump.py` reads (`base/exefs`, `base/romfs`, `updates/<version>/`, `dlc/<DLC title ID>/<n>/romfs`), and the game needs a profile in `dm/games`. The packer rewrites the profile's modules of the newest version (`--version N` for another) with `patch_nso.py --target android` into `<game folder>/../<title ID>-work/android-pack/` (`--out` for another folder) and leaves the RomFS out. A repeat run keeps the modules whose inputs did not change.
 

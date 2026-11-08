@@ -5,6 +5,19 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
+## Unreleased
+
+- **Preparing on Windows and Linux.** `scripts/pack_android.py` runs on Windows, Linux and the Mac (android/README.md, The environment):
+  - the shader translator starts through a launcher beside `dmsh_xlate.dll` for each system (`dmsh_xlate-<linux|win>-<x64|arm64>`, .NET apphosts of the
+    same translator); the committed `dmsh_xlate` is the Mac's. Checked on Linux: 75 Ocarina of Time shaders translate byte for byte as with the
+    earlier `dotnet dmsh_xlate.dll` wrapper, and the library version stays `v-0dd4341ae6ce`.
+  - Windows: text files are written with LF line ends (`scripts/lf_newlines.py`), the code is rewritten in one process (no `fork`), the RomFS paths
+    of a folder dump use `/` (`shader_split.py`), and files are replaced in place where a rename would fail.
+  - `.gitattributes` checks every text file out with LF, so the shader versions and the rewrite key are the same on every system.
+  - `tool_lock.py` checks the translator the environment's `XLATE` names.
+  - CI (`.github/workflows/prepare-pc.yml`) checks this on Windows and Linux.
+- Discussions are open, with a [device reports](https://github.com/EddizEge/AnkaNative/discussions/1) thread.
+
 ## Anka Native 0.2.0
 
 - **Prepare on the phone.** The APK now carries the real on-phone packer (CPython 3.14 with the repository's tools, the shader translator

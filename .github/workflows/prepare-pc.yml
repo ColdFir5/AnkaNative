@@ -1,0 +1,82 @@
+# Preparing a game on a computer (android/README.md) on Windows and Linux, without game files: the checkout has LF line ends (.gitattributes), so the
+# shader chain versions are the committed ones; the translator launcher for each system starts the committed dmsh_xlate.dll and reports the source the lock
+# names; text files the tools write on Windows have LF line ends (scripts/lf_newlines.py); and the packer's unit tests pass. The Mac runs the same tools
+# with its own apphost (tests.yml).
+name: prepare-pc
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-pc-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Prepare on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - name: Install the packer's Python packages
+        run: python -m pip install "capstone>=5,<6" lz4 zbic
+      - name: Install the .NET 10 runtime when the image has none
+        run: |
+          if dotnet --list-runtimes 2>/dev/null | grep -q '^Microsoft.NETCore.App 10\.'; then dotnet --list-runtimes; exit 0; fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -Command "Invoke-WebRequest https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1; ./dotnet-install.ps1 -Channel 10.0 -Runtime dotnet -InstallDir \"$env:ProgramFiles\dotnet\""
+          else
+            curl -sSfL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh && bash dotnet-install.sh --channel 10.0 --runtime dotnet --install-dir "$HOME/.dotnet"
+            echo "DOTNET_ROOT=$HOME/.dotnet" >> "$GITHUB_ENV"; echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          fi
+          dotnet --list-runtimes
+      - name: No CRLF in the checkout
+        run: |
+          bad=$(git ls-files --eol | grep 'w/crlf' | grep -v -E '\.(bat|cmd)$' || true)
+          [ -z "$bad" ] || { echo "$bad"; exit 1; }
+      - name: Shader chain versions are the committed ones
+        run: |
+          want=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' dm/gfx/nvn/dmsh_chain.h); got=$(python dm/gfx/tools/dmsh_chain.py)
+          echo "DMSH_CHAIN $got (committed $want)"; [ "$got" = "$want" ]
+          want=$(sed -n 's/^#define DMSH_VK_CHAIN "\(.*\)"/\1/p' dm/gfx/nvn/dmsh_chain_vk.h); got=$(DM_GAME=0400486024DEC000 python dm/gfx/tools/vk_android_build.py --version)
+          echo "DMSH_VK_CHAIN $got (committed $want)"; [ "$got" = "$want" ]
+          echo "Ocarina of Time shader inputs: $(DM_GAME=0400486024DEC000 python dm/gfx/tools/dmsh_chain.py --inputs) (Linux: 4610dec2c950)"
+          [ "$(DM_GAME=0400486024DEC000 python dm/gfx/tools/dmsh_chain.py --inputs)" = 4610dec2c950 ]
+      - name: The translator launcher starts the committed translator
+        run: |
+          x=$(python -c "import sys; sys.path.insert(0, 'scripts'); import pack_android; print(pack_android.xlate_program())")
+          echo "launcher: $x"
+          got=$("$x" --source-sha); want=$(sed -n 's/^xlate_source\t//p' dm/gfx/tools/dmsh_chain.lock)
+          echo "embedded source $got (lock $want)"; [ "$got" = "$want" ]
+          XLATE="$x" python -c "import sys; sys.path.insert(0, 'dm/gfx/tools'); import tool_lock; e = tool_lock.xlate_embedded(); print(e); sys.exit(e.startswith(tool_lock.NO_RUN))"
+      - name: Text files written with LF (lf_newlines.py)
+        run: |
+          printf 'import pathlib, sys\nopen(sys.argv[1], "w").write("a\\nb\\n")\npathlib.Path(sys.argv[2]).write_text("c\\n")\n' > lf_probe.py
+          python scripts/lf_newlines.py lf_probe.py lf_a.txt lf_b.txt
+          python -c "import sys; a = open('lf_a.txt', 'rb').read(); b = open('lf_b.txt', 'rb').read(); print(a, b); sys.exit(a != b'a\nb\n' or b != b'c\n')"
+      - name: Packer unit tests
+        run: |
+          for t in dm/tools/tests/test_pack_android.py dm/tools/tests/test_split_*.py; do
+            echo "== $t"; python -m unittest "$t" 2>&1 | tail -3
+            python -m unittest "$t" > /dev/null 2>&1 || fails="$fails $t"
+          done
+          [ -z "$fails" ] || { echo "failed:$fails"; exit 1; }

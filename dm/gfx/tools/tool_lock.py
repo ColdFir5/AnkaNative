@@ -26,12 +26,17 @@ NO_RUN = 'does not run'
 def xlate_embedded():
     """The source digest the translator embeds (dmsh_xlate --source-sha), or 'does not run (<its first error line>)': without a .NET 10 runtime for the architecture it starts as (a Python
     under Rosetta starts the universal apphost as x86_64) it exits 131 with nothing on stdout, which read as an empty digest and a stale translator (docs/reference/packing.md)"""
-    try: r = subprocess.run([os.path.join(XLATE_DIR, 'dmsh_xlate'), '--source-sha'], capture_output=True, text=True, errors='replace', timeout=60)
+    # the program XLATE names (Linux and Windows: the launcher beside dmsh_xlate.dll, pack_android.py xlate_program), else the Mac apphost
+    prog = os.environ.get('XLATE') or os.path.join(XLATE_DIR, 'dmsh_xlate')
+    try: r = subprocess.run([prog, '--source-sha'], capture_output=True, text=True, errors='replace', timeout=60)
     except (OSError, subprocess.SubprocessError) as e: return f'{NO_RUN} ({e})'
     if r.returncode == 0 and r.stdout.strip(): return r.stdout.strip()
     return '%s (%s)' % (NO_RUN, (r.stderr.strip().splitlines() or r.stdout.strip().splitlines() or [f'exit code {r.returncode}'])[0])
 
-def no_run_message(embedded): return f'the translator {embedded}: it needs the .NET 10 runtime for this Mac\'s architecture (brew install --cask dotnet-sdk); unset DOTNET_ROOT if it names another one'
+def no_run_message(embedded):
+    if sys.platform == 'darwin': return f'the translator {embedded}: it needs the .NET 10 runtime for this Mac\'s architecture (brew install --cask dotnet-sdk); unset DOTNET_ROOT if it names another one'
+    return (f'the translator {embedded}: it needs the .NET 10 runtime (https://dotnet.microsoft.com/download/dotnet/10.0, or the system\'s dotnet-runtime-10.0 package) '
+            'and, off the Mac, XLATE naming the launcher for this computer (pack_android.py sets it: dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate-<linux|win>-<x64|arm64>)')
 
 def check_tools():
     want = dict(l.rstrip('\n').split('\t', 1) for l in open(LOCK) if '\t' in l and not l.startswith('#'))

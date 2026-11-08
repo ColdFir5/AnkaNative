@@ -181,7 +181,7 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
     """patch_nso.py --target android on each module into out (each its own <module>.* files); a module whose key file matches is kept. Each module is
     rewritten into a staging folder and swapped in when it is complete (swap_in), so a run stopped part way never leaves new code with old tables.
     in_process: each in this process (run_in_process) with one worker, one module after the other"""
-    env = dict(os.environ, DM_GAME=g.id, DM_REWRITE_J=str(max(1, (os.cpu_count() or 4) // max(1, len(srcs)))))
+    env = tool_env(DM_GAME=g.id, DM_REWRITE_J=str(max(1, (os.cpu_count() or 4) // max(1, len(srcs)))))
     todo = {}
     for m, src in srcs.items():
         keys = rewrite_keys(src, g, out); key = keys[0]; kf = out / f'{m}.android.key'
@@ -215,7 +215,7 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
                 m = pending.pop(0); kf = out / f'{m}.android.key'; kf.unlink(missing_ok=True); shutil.rmtree(staging(out, m), ignore_errors=True)
                 print(f'  {m}: rewriting {todo[m][0]}', flush=True)
                 log = open(out / f'rewrite_{m}.log', 'w')
-                procs[m] = (subprocess.Popen([py, str(REPO / 'dm/tools/patch_nso.py'), str(rewriter_src(todo[m][0], out, m)), str(staging(out, m)), m, '--target', 'android'], env=env, stdout=log, stderr=subprocess.STDOUT), log)
+                procs[m] = (subprocess.Popen(tool_argv(py, REPO / 'dm/tools/patch_nso.py', rewriter_src(todo[m][0], out, m), staging(out, m), m, '--target', 'android'), env=env, stdout=log, stderr=subprocess.STDOUT), log)
             for m in list(procs):
                 p, log = procs[m]
                 if p.poll() is None: continue
@@ -230,6 +230,37 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
         for p, log in procs.values():
             if p.poll() is None: p.terminate(); p.wait()
             log.close()
+
+
+# Linux and Windows (the Mac needs none of this): the tools run as on the Mac, with
+#   - the translator: the committed dmsh_xlate_bin/dmsh_xlate is a Mac program; beside it, dmsh_xlate-<linux|win>-<x64|arm64>[.exe] start the same
+#     dmsh_xlate.dll with the .NET runtime (XLATE in the environment still names another)
+#   - Windows: no fork (patch_nso.py's workers are forked: DM_REWRITE_J=1 rewrites in one process), UTF-8, and text files written with LF
+#     (lf_newlines.py), since the phone's host and launcher read the tables these tools write with LF
+WINDOWS = os.name == 'nt'
+
+
+def xlate_program():
+    """The translator program for this computer: None on the Mac (vk_android_build.py's default) and on the phone (its library form), else the launcher
+    beside dmsh_xlate.dll"""
+    if sys.platform in ('darwin', 'android'): return None
+    import platform
+    arch = {'x86_64': 'x64', 'amd64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine().lower())
+    if not arch: raise Error(f'no translator launcher for a {platform.machine()} CPU (dm/gfx/tools/dmsh_xlate_bin has x64 and arm64): set XLATE')
+    return REPO / 'dm/gfx/tools/dmsh_xlate_bin' / (f'dmsh_xlate-win-{arch}.exe' if WINDOWS else f'dmsh_xlate-linux-{arch}')
+
+
+def tool_env(**kv):
+    """The environment a tool runs with: this one, kv, and on Linux and Windows the translator and Windows' settings (above)"""
+    env = dict(os.environ, **kv)
+    if 'XLATE' not in env and (x := xlate_program()) is not None: env['XLATE'] = str(x)
+    if WINDOWS: env.update(DM_REWRITE_J='1', PYTHONUTF8='1')
+    return env
+
+
+def tool_argv(py, script, *args):
+    """py running script with args; on Windows through lf_newlines.py, so the text files it writes have LF line ends"""
+    return [str(py), *([str(REPO / 'scripts/lf_newlines.py')] if WINDOWS else []), str(script), *map(str, args)]
 
 
 VK_BUILD = REPO / 'dm/gfx/tools/vk_android_build.py'
@@ -285,9 +316,8 @@ def split_shaders(a, g, vdir, pkg, parts=None):   # parts: the version's (romfs,
     py = shader_python(a.shader_python, split=True)
     tmp = pkg.with_name(pkg.name + '.tmp'); shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
     print(f'shaders: splitting the shaders out of {rd} into {pkg} with {py} (a few minutes)', flush=True)
-    env = dict(os.environ, DM_GAME=g.id)
-    r = subprocess.run([py, str(SPLIT), str(rd), str(ed / 'main'), str(tmp / 'pkg'),
-                        *[str(tmp / f) for f in ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')]], env=env)
+    env = tool_env(DM_GAME=g.id)
+    r = subprocess.run(tool_argv(py, SPLIT, rd, ed / 'main', tmp / 'pkg', *[tmp / f for f in ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')]), env=env)
     if r.returncode: raise Error(f'shader_split.py exit code {r.returncode}')
     if (g.dir / 'shader_map.tsv').is_file():
         want, have = map_keys(g.dir / 'shader_map.tsv'), map_keys(tmp / 'shader_map.tsv')
@@ -315,8 +345,8 @@ def pack_shaders(a, g, work, out, vdir, parts=None):
         py = shader_python(a.shader_python)
         print(f'shaders: building the Vulkan library {lib} from {pkg} with {py} (J={a.J}; about 10 minutes on DKB)', flush=True)
         (work / 'android-shaders' / 'work').mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ, DM_GAME=g.id, J=str(a.J), WORK=str(work / 'android-shaders' / 'work'))
-        r = subprocess.run([py, str(VK_BUILD), '--target', 'vulkan', str(pkg), str(cache)], env=env)
+        env = tool_env(DM_GAME=g.id, J=str(a.J), WORK=str(work / 'android-shaders' / 'work'))
+        r = subprocess.run(tool_argv(py, VK_BUILD, '--target', 'vulkan', pkg, cache), env=env)
         if r.returncode: raise Error(f'vk_android_build.py exit code {r.returncode} (a package that lacks the profile\'s shaders stops it: delete {pkg} and the split runs again)')
         if not library_current(lib, g): raise Error(f'vk_android_build.py finished but {lib} is not a full library of {g.id} with the current inputs')
     else: print(f'shaders: {lib} is current (game {g.id}, inputs {dmsh_chain.inputs(g)})')
@@ -326,7 +356,7 @@ def pack_shaders(a, g, work, out, vdir, parts=None):
     for f in (VK_LIB, dmsh_chain.STAMP):
         s_, d_ = lib / f, dst / f
         if d_.is_file() and d_.stat().st_size == s_.stat().st_size and d_.stat().st_mtime_ns == s_.stat().st_mtime_ns: continue
-        tmp = d_.with_name(f + '.partial'); shutil.copy2(s_, tmp); tmp.rename(d_)
+        tmp = d_.with_name(f + '.partial'); shutil.copy2(s_, tmp); tmp.replace(d_)
     others = sorted(o.name for o in (out / 'shaders').iterdir() if o.name != name and o.name.startswith(VK_PREFIX) and o.is_dir())
     if others:   # kept: another APK (the test and the play app, an older build) may load one of them from this pack; delete by hand to save the space
         print(f'shaders: kept the libraries of other versions in {out / "shaders"}: {", ".join(others)} (about 350 MB each)')
@@ -340,6 +370,7 @@ def commit():   # the packer's commit; DM_PACKER_COMMIT when the repository's to
 
 
 def main():
+    if WINDOWS: import lf_newlines; lf_newlines.install()   # pack.tsv and the keys this script writes, with LF as on the Mac
     ap = argparse.ArgumentParser(description='Pack a dumped game for the Android launcher: its code modules rewritten with --target android, no RomFS')
     ap.add_argument('game', type=Path, help='the game folder (base/exefs, base/romfs or an update\'s romfs, updates/<version>/, dlc/), or a .nup file')
     ap.add_argument('--version', type=int, help='the update version to pack (default: the newest in updates/; 0 = the base game)')
@@ -398,7 +429,7 @@ def main():
                 *[('aoc', f'{tid - app - 0x1000}\t{rel(p)}') for tid, p in sorted(dlc.items())],
                 *([('shaders', shaders.relative_to(out).as_posix())] if shaders else []), ('packer', commit())]
         tmp = out / 'pack.tsv.partial'
-        tmp.write_text(''.join(f'{k}\t{v}\n' for k, v in rows)); tmp.rename(out / 'pack.tsv')
+        tmp.write_text(''.join(f'{k}\t{v}\n' for k, v in rows)); tmp.replace(out / 'pack.tsv')
         size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
     except (Error, pack_dump.Error) as e: sys.exit(f'[RED] {e}')
     print(f'done: {out} ({size / 2**20:.1f} MiB); RomFS {rel(romfs)} and {len(dlc)} DLC stay in the game folder')
