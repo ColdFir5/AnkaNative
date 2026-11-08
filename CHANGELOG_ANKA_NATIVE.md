@@ -5,7 +5,7 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
-## Unreleased
+## Anka Native 0.2.1
 
 - **Prepare on the phone stopped at the end for Ocarina of Time** ([#3](https://github.com/EddizEge/AnkaNative/issues/3)): "76 of 42346 shaders did
   not build: no library written". The same 76 do not build on a computer either (74 that SPIRV-Tools refuses, "Vector access is out of bounds"; a
