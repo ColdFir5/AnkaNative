@@ -131,8 +131,13 @@ On-screen controls have a layout editor; gamepads work. Every switch the host re
 - **Anti-aliasing** is not visible yet: the game's SMAA pass runs, but its blend weights are all zero.
 - Donkey Kong Bananza and Mario Kart World were **not tested** with Anka Native's changes. Only one phone was tried.
 - The phone gets hot, and the frame rate drops when it throttles.
-- This release's app is a per-game test build: its icon has a small "T" badge, and it reads extra switches from `env.txt` in its files
-  folder.
+
+## Feedback
+
+Tell us how it runs on your phone in [Discussions](https://github.com/EddizEge/AnkaNative/discussions): the
+[device reports](https://github.com/EddizEge/AnkaNative/discussions/1) thread has a short template (phone, RAM, driver, game, frame rate, what works
+and what does not). Bugs you can reproduce go to [Issues](https://github.com/EddizEge/AnkaNative/issues). Settings › Share log sends the app's
+newest log. Never post game files, keys or packs.
 
 ## Building
 
