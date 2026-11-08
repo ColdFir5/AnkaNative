@@ -50,8 +50,23 @@ final class Ondevice {
         root.addView(panel.view, index);
     }
 
+    /**
+     * Whether this APK can prepare a game on the phone: it carries the real packer (-PnxPackEngine=native), or it is a test build, whose simulated engine (FakeEngine)
+     * is there for UI work. A play or release build without the packer offers no Prepare: the simulated engine's placeholder pack never starts, so its Prepare only
+     * looked done (Anka Native 0.1.0 shipped that way)
+     */
+    static boolean available() { return "native".equals(BuildConfig.NX_PACK_ENGINE) || !BuildConfig.NX_PLAY; }
+
+    /** What to do instead when this APK cannot prepare a game (available() is false) */
+    static final String UNAVAILABLE = "This version of Anka Native cannot prepare a game on the phone. Prepare it once on a computer (Linux or Mac), as the README's "
+            + "\"Install\" steps say (github.com/EddizEge/AnkaNative), copy the pack next to the dump as <title ID>-work/android-pack, then add the game again or pick "
+            + "that pack folder.";
+
     /** Prepare the dump (MainActivity's Add game, a game card's Prepare again): checked off the main thread, then asked before anything is written */
-    static void prepare(MainActivity a, File dump, boolean again) { if (panel != null && panel.a == a) panel.picked(dump, false, null, again); }
+    static void prepare(MainActivity a, File dump, boolean again) {
+        if (!available()) { a.error(UNAVAILABLE); return; }
+        if (panel != null && panel.a == a) panel.picked(dump, false, null, again);
+    }
 
     /** Shaders a delta update of this pack translates (the profile's manifest rows for the pack's older libraries, ShaderLibs.toTranslate), -1 when the manifest has none of them */
     static int deltaShaders(File packDir, String titleId) { return Pack.deltaShaders(packDir, titleId); }
@@ -74,12 +89,13 @@ final class Ondevice {
      * (a game added with another pack, e.g. the play app's beside the dump), never a whole job, never a job for another pack folder
      */
     static void autoUpdate(MainActivity a, File dump, File packDir, String titleId) {
-        if (panel == null || panel.a != a || panel.alive() || deltaShaders(packDir, titleId) < 0 || !autoTried.add(dump.getPath())) return;
+        if (!available() || panel == null || panel.a != a || panel.alive() || deltaShaders(packDir, titleId) < 0 || !autoTried.add(dump.getPath())) return;
         panel.picked(dump, true, packDir, false, true);
     }
 
-    /** Whether a folder or .nup is a dump Prepare can start from: an update, or a base game with its code and RomFS (Pack.isDump; DumpCheck checks it fully) */
-    static boolean isDump(File dir) { return Pack.isDump(dir); }
+    /** Whether a folder or .nup is a dump Prepare can start from: an update, or a base game with its code and RomFS (Pack.isDump; DumpCheck checks it fully);
+     *  never without a packer (available()), so no card or dialog offers a Prepare that cannot make a pack */
+    static boolean isDump(File dir) { return available() && Pack.isDump(dir); }
     static void resume(MainActivity a) { if (panel != null && panel.a == a) panel.resume(); }
 
     static void pause(MainActivity a) { if (panel != null && panel.a == a) panel.pause(); }
@@ -322,6 +338,7 @@ final class Ondevice {
 
         /** card: an automatic update of a game card's pack (autoUpdate): packOverride is that pack, checked as the pack to keep; nothing else is started or asked */
         void picked(File dump, boolean start, File packOverride, boolean again, boolean card) {
+            if (!available()) { if (!card) a.error(UNAVAILABLE); return; }
             if (a.needAccess()) return;
             android.widget.Toast.makeText(a, "Checking " + dump + "…", android.widget.Toast.LENGTH_SHORT).show();
             new Thread(() -> {

@@ -54,7 +54,7 @@ fi
 [ $# -eq 0 ] || die "usage: release.sh [--fingerprint]"
 
 GAMES=${ANKA_GAMES:-0400486024DEC000}
-VERSION=${ANKA_VERSION:-0.1.0}; CODE=${ANKA_VERSION_CODE:-1}
+VERSION=${ANKA_VERSION:-0.1.1}; CODE=${ANKA_VERSION_CODE:-2}
 ENGINE=${ANKA_PACK_ENGINE:-fake}
 OUT=${ANKA_RELEASE_DIR:-$HOME/anka-native-releases/$VERSION}
 inside_repo "$OUT" && die "the release folder must be outside this repository: $OUT"

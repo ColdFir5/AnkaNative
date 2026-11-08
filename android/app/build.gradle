@@ -24,8 +24,8 @@ if (nxApp && nxPlay) throw new GradleException('nxApp and nxPlay build different
 // with the owner's release key (docs/RELEASING.md, android/tools/release.sh). -PnxVersion sets its version
 def nxLive = providers.gradleProperty('nxLive').getOrElse('false') == 'true'
 if (nxLive && (nxPlay || nxApp)) throw new GradleException('nxLive builds the release app: give neither nxPlay nor nxApp')
-def nxVersion = providers.gradleProperty('nxVersion').getOrElse('0.1.0')
-def nxVersionCode = providers.gradleProperty('nxVersionCode').getOrElse('1') as int
+def nxVersion = providers.gradleProperty('nxVersion').getOrElse('0.1.1')
+def nxVersionCode = providers.gradleProperty('nxVersionCode').getOrElse('2') as int
 // The release key never lives in this repository: its keystore path, alias and passwords are read from the environment, or else from the user's
 // ~/.gradle/gradle.properties (GRADLE_USER_HOME), never from a gradle.properties or -P in the project: ANKA_KEYSTORE (a keystore outside this repository),
 // ANKA_KEY_ALIAS, ANKA_KEYSTORE_PASSWORD and ANKA_KEY_PASSWORD (the key's own password; the store's when unset). Only -PnxLive=true reads them

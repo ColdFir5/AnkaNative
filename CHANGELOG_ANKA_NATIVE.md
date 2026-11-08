@@ -5,6 +5,14 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
+## Anka Native 0.1.1
+
+- **Prepare on the phone looked done but made nothing to play.** 0.1.0 was built without the on-phone packer (`-PnxPackEngine=fake`), so its
+  Prepare ran the simulated engine: the progress finished, but the pack it made is a placeholder with no game code and no shaders, and Play could
+  not start it. A play or release build without the packer now offers no Prepare (`Ondevice.available()`): Home and the game's card say to prepare
+  the game on a computer (README "Install") and to pick that pack, and a placeholder pack left by 0.1.0 is shown as "No pack" and Play says why.
+  Test builds keep the simulated engine for UI work.
+
 ## Anka Native 0.1.0
 
 The first release: Ocarina of Time (the Switch 2 remake, `0400486024DEC000`) brought up on Android. Measured on one phone only, a POCO F8 Pro

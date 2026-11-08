@@ -322,12 +322,13 @@ public final class MainActivity extends Activity {
         TextView h = Ui.heading(this, "Add your game");
         h.setGravity(Gravity.CENTER);
         Ui.add(c, h, 12, Ui.wrap());
-        TextView t = Ui.small(this, "Pick your dump folder, the one with base/ (and updates/), or your game's .nup file.");
+        TextView t = Ui.small(this, Ondevice.available() ? "Pick your dump folder, the one with base/ (and updates/), or your game's .nup file."
+                : "Prepare the game once on a computer (the README's Install steps), copy the pack next to the dump, then pick your dump folder or .nup file.");
         t.setGravity(Gravity.CENTER);
         Ui.add(c, t, 6, Ui.wrap());
         LinearLayout steps = Ui.row(this);
         steps.setGravity(Gravity.CENTER);
-        String[] s = {"1  Pick dump", "2  Prepare", "3  Play"};
+        String[] s = Ondevice.available() ? new String[] {"1  Pick dump", "2  Prepare", "3  Play"} : new String[] {"1  Prepare on PC", "2  Pick dump", "3  Play"};
         for (int k = 0; k < s.length; k++) {
             LinearLayout.LayoutParams lp = Ui.wrap();
             if (k > 0) lp.leftMargin = dp(6);
@@ -386,6 +387,7 @@ public final class MainActivity extends Activity {
         boolean dump = Ondevice.isDump(gd);
         Pack p;
         try { p = Pack.read(pd); } catch (IOException e) { return new Problem(dump ? "Needs preparing" : "No pack", dump); }
+        if (p.simulated) return new Problem(dump ? "Needs preparing" : "No pack", dump);   // a simulated engine's placeholder (0.1.0's Prepare made one): never started
         if (p.unfinishedModule() != null) return new Problem(dump ? "Needs preparing" : "Pack unfinished", dump);
         if (PackCheck.rewriting(this, pd, gd, p.titleId) != null) return new Problem("Preparing…", false);
         BuildCheck.Result b = BuildCheck.build(p, gd);
@@ -617,7 +619,7 @@ public final class MainActivity extends Activity {
                 String why = Profile.missing(k.id, single ? "This game" : g.getName());
                 if (why != null) { k.unsupported = true; k.error = why; continue; }
                 k.name = Profile.of(k.id).name;
-                k.dump = Pack.isDump(g);
+                k.dump = Ondevice.isDump(g);   // false when this APK has no packer: then it is added like any folder without a pack
                 String pp = Folders.pickedPack(this, k.id);
                 File pd = pp == null ? null : new File(pp);
                 try { if (pd != null && !Pack.read(pd).titleId.equals(k.id)) pd = null; } catch (IOException e) { pd = null; }
@@ -642,7 +644,7 @@ public final class MainActivity extends Activity {
             askReplace(k.name, k.game, k.others, replace -> {
                 if (k.pack != null) { addWithPack(k.game, k.id, k.pack.dir, replace); return; }
                 if (replace != null) removeEntries(replace);   // the user chose this dump: the other's card goes now (nothing is deleted), this one's comes with its pack
-                if (k.found != null && k.found.error == null) {
+                if (Ondevice.available() && k.found != null && k.found.error == null) {
                     if (k.found.build >= 0 && k.found.build != k.found.version)
                         android.util.Log.i("nxnative", "Add game: " + k.game.getName() + " " + DumpLayout.name(k.found.version) + " is " + Profile.of(k.id).buildName(k.found.build) + " by its build IDs");
                     Ondevice.prepare(this, k.game, false);
@@ -653,6 +655,7 @@ public final class MainActivity extends Activity {
                 String what = Nup.isNup(k.game) ? ".nup" : "folder";
                 // Why Prepare cannot start from it (another build than this app's, an incomplete dump), plainly; a pack made elsewhere can still be picked
                 String why = k.found != null && k.found.error != null ? k.found.error
+                        : !Ondevice.available() ? "No pack found for this " + what + ". " + Ondevice.UNAVAILABLE
                         : "No pack found for this " + what + ", and it is not a dump Prepare can start from.";
                 new AlertDialog.Builder(this).setTitle(k.found != null && k.found.version < 0 && k.found.titleId != null && Profile.of(k.found.titleId) != null && !DumpLayout.versions(k.game).isEmpty()
                                 ? "Another version of " + k.name : "No pack for this " + what)
@@ -809,6 +812,12 @@ public final class MainActivity extends Activity {
         } catch (IOException e) {
             if (dump) packProblem(g, "The pack cannot be used: " + e.getMessage(), pickPack);
             else error(e.getMessage());
+            return;
+        }
+        if (p.simulated) {   // a placeholder of the simulated engine (Anka Native 0.1.0's Prepare made one): it has no game code and no shaders, so it never starts
+            if (dump) packProblem(g, "This pack is a placeholder, not a pack to play.", pickPack);
+            else new AlertDialog.Builder(this).setTitle("No pack for " + g.name).setMessage(Ondevice.UNAVAILABLE + "\n\nPack: " + g.packDir)
+                    .setNegativeButton("Cancel", null).setPositiveButton("Pick pack folder", (d, w) -> pickPack.run()).show();
             return;
         }
         // The pack's code must be of the game build in the folder (else the game crashes at once), and of a build this app supports: a plain message, and Prepare
