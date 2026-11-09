@@ -54,7 +54,7 @@ fi
 [ $# -eq 0 ] || die "usage: release.sh [--fingerprint]"
 
 GAMES=${ANKA_GAMES:-0400486024DEC000}
-VERSION=${ANKA_VERSION:-0.2.1}; CODE=${ANKA_VERSION_CODE:-4}
+VERSION=${ANKA_VERSION:-0.2.2}; CODE=${ANKA_VERSION_CODE:-5}
 ENGINE=${ANKA_PACK_ENGINE:-native}
 if [ "$ENGINE" = native ]; then
     [ -n "${NX_PACK_STAGE:-}" ] && [ -f "$NX_PACK_STAGE/lib/libnxpack.so" ] || die "set NX_PACK_STAGE to the on-phone packer's stage (android/ondevice/build.sh <work dir> makes <work dir>/stage), or ANKA_PACK_ENGINE=fake"

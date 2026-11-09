@@ -5,7 +5,7 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
-## Unreleased
+## Anka Native 0.2.2
 
 - **The launcher no longer takes adb control commands from other apps** ([#7](https://github.com/EddizEge/AnkaNative/issues/7)). Its activity is
   exported, as every launcher's is, and the test commands that add a game, start Prepare, install or pick a GPU driver and export or import a pack
