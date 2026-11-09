@@ -5,6 +5,14 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
+## Unreleased
+
+- **The launcher no longer takes adb control commands from other apps** ([#7](https://github.com/EddizEge/AnkaNative/issues/7)). Its activity is
+  exported, as every launcher's is, and the test commands that add a game, start Prepare, install or pick a GPU driver and export or import a pack
+  (android/TESTING.md) were taken from any app's intent. A play or release build now ignores them, with a toast and a log line, unless
+  **Settings › ADB control (debug)** is on: off by default, and turning it on asks first. Test builds take them as before. Starting a game from a
+  frontend (the `.Launch` and `.Open` aliases) is unchanged.
+
 ## Anka Native 0.2.1
 
 - **Prepare on the phone stopped at the end for Ocarina of Time** ([#3](https://github.com/EddizEge/AnkaNative/issues/3)): "76 of 42346 shaders did

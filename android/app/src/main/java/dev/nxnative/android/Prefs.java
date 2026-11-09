@@ -101,6 +101,14 @@ final class Prefs {
      * live in a file in the app's cache folder instead of anonymous memory: clean file pages the kernel drops instead of compressing them into zram. For phones
      * short of RAM with free storage; it writes the pools' data to storage once per area load (Ocarina of Time: ~2 GB). Lines in env.txt or the game's own lines win.
      */
+    /**
+     * Whether the launcher acts on the adb control extras of the intents that start it (MainActivity.CONTROL_EXTRAS: add a game, start Prepare, install or pick a GPU
+     * driver, export or import a pack; android/TESTING.md). MainActivity is exported, as every launcher activity is, so any app may start it with them: a play or
+     * release build takes them only when the user turned this on (Settings › ADB control, off by default; issue #7); a test build always does
+     */
+    static boolean adbControl(Context c) { return !BuildConfig.NX_PLAY || of(c).getBoolean("adb_control", false); }
+    static void adbControl(Context c, boolean on) { of(c).edit().putBoolean("adb_control", on).commit(); }
+
     static boolean ramSaver(Context c, String titleId) { return of(c).getBoolean(gameKey("ram_saver", titleId), false); }
     static void ramSaver(Context c, String titleId, boolean on) { of(c).edit().putBoolean(gameKey("ram_saver", titleId), on).commit(); }
 

@@ -175,6 +175,18 @@ public final class MainActivity extends Activity {
                 .value("Can this phone run your games?").chevron(this).view);   // (ReadinessActivity.java)
         help.addView(new Ui.Setting(this, "🧪", "Graphics self-test", v -> startActivity(new Intent(this, SelftestActivity.class))).value("Needs no game").chevron(this).view);
         help.addView(new Ui.Setting(this, "📨", "Share log", v -> shareLog()).value("The newest log").chevron(this).view);
+        if (BuildConfig.NX_PLAY) {   // a test build always takes adb commands (Prefs.adbControl)
+            Ui.Setting adb = new Ui.Setting(this, "🛠", "ADB control (debug)", null).value("Lets adb commands add games, start Prepare and install GPU drivers. Off: only you, in the app");
+            adb.toggle(this, Prefs.adbControl(this), (b, on) -> {
+                if (on == Prefs.adbControl(this)) return;   // the switch set to what is stored (below): nothing to do
+                if (!on) { Prefs.adbControl(this, false); return; }
+                b.setChecked(false);   // stays off until confirmed
+                Ui.confirmDanger(this, "Turn ADB control on?", "While it is on, adb, and any other app on this phone, can add games, start Prepare and install or pick a GPU "
+                        + "driver through Anka Native's launcher, without asking you. A GPU driver is code that runs inside the game. Turn it on only while you use adb, then off again.",
+                        "Turn on", () -> { Prefs.adbControl(this, true); b.setChecked(true); });
+            });
+            help.addView(adb.view);
+        }
 
         Ui.add(content, Ui.section(this, "About"), Ui.SECTION_GAP);
         LinearLayout about = Ui.add(content, Ui.card(this), 8);
@@ -230,7 +242,21 @@ public final class MainActivity extends Activity {
 
     /** adb: am start -n dev.nxnative.android/.MainActivity --es game <game folder> [--es pack <pack folder>] [--es save <save folder>] [--ez run true] adds the game without
      *  the pickers (android/TESTING.md); --es add_game <folder or .nup> takes Add game's own path instead (gamePicked: all of a folder's games added, Prepare asked); save is the save folder Folders would pick for it (test runs of a play or release app keep away from the user's saves/<id>) */
+    /** The extras of the adb control commands above and in Ondevice, GpuDriver and PackUi (android/TESTING.md): taken only when Prefs.adbControl allows them */
+    static final String[] CONTROL_EXTRAS = {"game", "add_game", "pack", "save", "run", "ondevice_dump", "ondevice_start", "ondevice_pause", "ondevice_pack", "show_when_locked",
+            "gpu_driver_zip", "gpu_driver", "pack_title", "pack_export", "pack_import"};
+
     private void fromIntent(Intent i) {
+        if (!Prefs.adbControl(this)) {
+            List<String> asked = new ArrayList<>();
+            for (String k : CONTROL_EXTRAS) if (i.hasExtra(k)) asked.add(k);
+            if (!asked.isEmpty()) {   // another app (or adb) asked for a control command: never acted on while ADB control is off (issue #7)
+                android.util.Log.w("nxnative", "launcher intent from " + getReferrer() + " with " + asked + " ignored: ADB control is off (Settings › ADB control)");
+                Toast.makeText(this, "A command from another app was ignored (Settings › ADB control is off)", Toast.LENGTH_LONG).show();
+                i = new Intent(i);
+                for (String k : asked) i.removeExtra(k);
+            }
+        }
         if (settingsPage && (i.hasExtra("game") || i.hasExtra("add_game") || i.hasExtra("ondevice_dump") || i.hasExtra("ondevice_pause"))) page(false);   // these act on Home's cards
         Ondevice.fromIntent(this, i);   // --es ondevice_dump <dump folder> [--ez ondevice_start true] (Ondevice)
         GpuDriver.fromIntent(this, i);   // --es gpu_driver_zip <zip> / --es gpu_driver <name | system>

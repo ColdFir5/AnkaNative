@@ -50,6 +50,10 @@ Open nxnative and tap **Grant All files access**, then turn on "Allow access to 
 adb shell appops set --uid dev.ankanative.android.test MANAGE_EXTERNAL_STORAGE allow
 ```
 
+The launcher's adb commands below (`--es game`, `add_game`, `ondevice_*`, `gpu_driver_zip`, `gpu_driver`, `pack_*`) work in a test build as they are. A play or release
+build ignores them (with a toast and a log line) until **Settings › ADB control (debug)** is on: its launcher is exported, so any app could send them (issue #7).
+Turn it off again after testing.
+
 ## 5. Add the game
 
 Tap **Add game**, open `SW2`, then `DonkeyKongBananza`, and tap **Use this folder** (allow access when asked). The launcher finds the pack in `SW2/040074A01BF12000-work/android-pack` (or any `<title ID>-work/<name>/` with a `pack.tsv` in the game's folder or up to three folders above it, `PackFind`) and lists "Donkey Kong Bananza (040074A01BF12000)" with no question when the pack fits (the dump's game build, this APK's shader library, or an older library the automatic shader update brings current). Without one it offers **Prepare** (above), **Use an existing pack…** or **Import pack…**. Picking `SW2` itself adds every game in it (each `.nup` and dump subfolder) and says in one message what was added, what this app cannot run and what needs Prepare.
