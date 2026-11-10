@@ -533,8 +533,24 @@ One pagemap pass serves the touched line and the footprint lines (`mem_scan`): e
 - **Symptom:** on the phone, `bindless tables: 1048576 textures, …` at start, and about 68 MiB of graphics memory held for the process's life that no texture uses: Ocarina of Time's highest texture ID in a run is about 5,200.
 - **Cause:** the update-after-bind set (`vka_tex.c` `bindless_init`) is sized to the device's limits, at most 2^20 sampled textures, 4,096 samplers and 65,536 storage images, and Turnip backs each slot with 64 bytes of descriptor memory: 64 MiB for the texture table and 4 MiB for the image table.
 - **Fix:** `DM_VK_TEX_SLOTS=<n>` and `DM_VK_IMG_SLOTS=<n>` cap the two tables (restart; 0, the default, keeps the device's limits). An ID past a table is logged once (`texture ID … beyond the table`) and its slot is never written; a shader that indexes the pool with it reads past the table, which Vulkan leaves undefined (a GPU fault is possible), so the cap must stay above the game's highest ID. The `bindless tables:` line gives the descriptor memory the tables take.
-- **Check:** NDK 28.2 build of `vka_tex.c`. For Ocarina of Time, `DM_VK_TEX_SLOTS=65536` should give back about 60 MiB; not yet run on the phone.
-- **Found on:** [Ocarina of Time (Switch 2)](../../dm/games/0400486024DEC000/README.md) on the POCO F8 Pro (2026-11-07).
+- **Check:** NDK 28.2 build of `vka_tex.c`. Galaxy S26 Ultra (Adreno 840 system driver, 2026-11-10), Ocarina of Time: the driver's own report (`DM_VK_MEMREPORT=1`) gives 282 MiB of descriptor pools with the full tables, about 256 bytes a slot there, not Turnip's 64, and 34.5 MiB with `DM_VK_TEX_SLOTS=65536`; per-process GPU memory (`dumpsys gpu --gpumem`) at the title after 31 s 1490 against 1243 MiB. The game's texture pools hold 33,280 IDs in all (the `texture pools:` line), no `beyond the table` line, frame rate unchanged.
+- **Found on:** [Ocarina of Time (Switch 2)](../../dm/games/0400486024DEC000/README.md) on the POCO F8 Pro (2026-11-07) and the Galaxy S26 Ultra (2026-11-10).
+
+### The driver keeps freed pool memory through its first map (Android, Adreno system driver)
+
+- **Symptom:** per-process GPU memory (`dumpsys gpu --gpumem`) grows by a pool's size each time the game makes and finalizes a memory pool, and never falls, while the host's own count (`memory: placed pools …`) and the driver's own report (`DM_VK_MEMREPORT=1`: `memory report: … freed`) stay flat. Ocarina of Time's title screen: +56 MiB every 3 s (a 48.2 MiB and an 8 MiB pool at each loop of the logo video), 560 MiB after 30 s, and about 665 MiB still held in gameplay.
+- **Cause:** `vka_mem.c` `place` maps a pool's new Vulkan memory where the driver likes (`vkMapMemory`) to copy the pool's bytes in, unmaps it, then maps it placed over the guest range (`vkMapMemory2KHR`). The Adreno 840 system driver (2150932499) leaves the first mapping in the process after `vkUnmapMemory`, and its `vkFreeMemory` takes down only the placed one: the first mapping of `/dev/kgsl-3d0` stays and the kernel keeps the memory object. `DM_VK_UNPLACE_REMAP=1` (another order of free and move) does not change it.
+- **Fix:** a workaround of the driver's fault: after the free, `stale_map_drop` unmaps a mapping that still starts at the first map's address with the placed map's file, the same offset and the memory's size (read from `/proc/self/maps` before and after the free). `DM_VK_STALE_MAP=0` leaves it, to measure the leak. Not a root-cause fix: copying through the placed map alone would need the placed map first, and the driver's behaviour with one map only is not tested.
+- **Check:** Galaxy S26 Ultra, Ocarina of Time, 2026-11-10: GPU memory at the title flat at 745 MiB from 9 s to 40 s (before: 800 rising to 1243 at 31 s); in Kokiri Forest 2300 MiB against 2845 (both with `DM_VK_TEX_SLOTS=65536`), the gap to the driver's report about 150 MiB against 665; 64 maps, 662 MiB, unmapped in a 95 s run; 30 fps as before, no new `[RED]` lines.
+- **Found on:** [Ocarina of Time (Switch 2)](../../dm/games/0400486024DEC000/README.md) on the Galaxy S26 Ultra (2026-11-10).
+
+### Reading what the driver itself holds (Android)
+
+- **Symptom:** graphics memory in `dumpsys meminfo` or `dumpsys gpu --gpumem` is far above the host's count of pools, images and scratch, and nothing in the log says where it is.
+- **Cause:** descriptor pools, command buffers, pipelines and the driver's own images are allocated inside the driver.
+- **Fix:** `DM_VK_MEMREPORT=1` (`vka_dev.c`, `VK_EXT_device_memory_report`): every 10 s a `memory report:` line with live, made and freed memory per object type and heap, and a line for each of the first 60 frees of 4 MiB or more. What the driver calls live is the driver's own cost per type; the difference to `--gpumem` is memory the kernel holds that the driver calls freed.
+- **Check:** found the two entries above on the Galaxy S26 Ultra (2026-11-10).
+- **Found on:** [Ocarina of Time (Switch 2)](../../dm/games/0400486024DEC000/README.md) on the Galaxy S26 Ultra (2026-11-10).
 
 ### GPU readback without an autorelease pool
 

@@ -298,3 +298,38 @@ void mtl_gpu_extra(uint64_t f, char *out, size_t n) {
     pthread_mutex_unlock(&g_tsmu);
 }
 #endif
+
+#ifdef __ANDROID__
+// The phone's thermal status for the frame step's thermal cap (hle_nvn.c thermal_capped: at 2 or more the step holds 30 fps until the device has been calmer for 30 s;
+// DM_THERMAL_CAP=0 turns the cap off). The cap's scale is iOS's (0 nominal, 1 fair, 2 serious, 3 critical); here 0, or 2 and more when either reading says warm:
+// - AThermal_getCurrentThermalStatus (API 30; 0 none, 1 light, 2 moderate, 3 severe, 4 critical and above) at or above DM_THERMAL_ANDROID_AT (read once; default 1,
+//   light; 0: not used): given as status + 1
+// - AThermal_getThermalHeadroom (API 31; forecast 10 s; 1.0 = the severe threshold) at or above DM_THERMAL_ANDROID_HEADROOM (read once; default 0.82; 0: not used):
+//   given as 2. Asked every third read (the platform answers NaN when asked more than about once a second, and the launcher's overlay asks too); NaN keeps the last value
+// Why this early: on a Galaxy S26 Ultra (skin thresholds 38 / 40 / 42 °C for light / moderate / severe) Ocarina of Time at 60 fps took the skin from 33.6 to 42.2 °C in
+// 56 s and the system cut the GPU clock from 1200 to 902 MHz; the status turned light only at 40.3 °C, the headroom read 0.85 near 39 °C (2026-11-10).
+// Read at most once a second by the caller; -1 when the platform gives neither (the cap then never holds)
+int dm_thermal_now(void) {
+    static void *mgr; static int (*status)(void *); static float (*headroom)(void *, int); static int state, at, n; static float hat, h;   // state: 0 not tried, 1 usable, -1 not available
+    if (!state) {
+        state = -1;
+        const char *e = getenv("DM_THERMAL_ANDROID_AT"); at = e && *e ? atoi(e) : 1;
+        e = getenv("DM_THERMAL_ANDROID_HEADROOM"); hat = e && *e ? (float)atof(e) : 0.82f;
+        void *lib = dlopen("libandroid.so", RTLD_NOW);
+        void *(*acquire)(void) = lib ? dlsym(lib, "AThermal_acquireManager") : NULL;
+        status = lib ? dlsym(lib, "AThermal_getCurrentThermalStatus") : NULL; headroom = lib ? dlsym(lib, "AThermal_getThermalHeadroom") : NULL;
+        if (acquire && (status || headroom) && (mgr = acquire())) {
+            state = 1;
+            VLOG("thermal status %d from the platform, headroom %s; the frame step holds 30 fps from status %d or headroom %.2f (DM_THERMAL_ANDROID_AT, DM_THERMAL_ANDROID_HEADROOM, DM_THERMAL_CAP)",
+                 status ? status(mgr) : -1, headroom ? "read" : "not available", at, hat);
+        } else VRED("no thermal status from the platform (AThermal): the frame step has no thermal cap");
+    }
+    if (state < 0) return -1;
+    int s = status ? status(mgr) : -1, r = at > 0 && s >= at ? s + 1 : 0;
+    if (headroom && hat > 0) {
+        if (n++ % 3 == 0) { float v = headroom(mgr, 10); if (v == v) h = v; }
+        if (h >= hat && r < 2) r = 2;
+    }
+    return r;
+}
+#endif

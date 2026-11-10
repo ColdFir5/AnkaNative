@@ -28,7 +28,24 @@ _max_res_cuts = {
     (0x805bd0, 'e8410036', '0f020014', 'dynamic resolution update: tbz w8,#0,+0x83c (flag bit 0 clear: scale 1.0) -> b +0x83c (DM_OOT_MAX_RES=1 diagnostic: always scale 1.0)'),
   ],
 }
-CUTS = _max_res_cuts if _max_res == '1' else {}
+
+# DM_OOT_FLOOR_RES=1 (the rewriter's environment, as DM_OOT_MAX_RES; default off; not with DM_OOT_MAX_RES=1): the dynamic resolution stays at its lowest level.
+# main+0x8065e0 picks the level the controller moves to: 0 (the largest) when the predicted GPU time at full size is under the budget (+0x806694), else the first level of the
+# list at controller+0x190 whose predicted time fits, else the last one, count - 1 (w8 at +0x806698). On the phone the game sits at the last level (683x384 for 2048x1152),
+# where the NDSR network d99fbeeb53d38847 is the host's stand-in (DM_VK_NDSR_STANDIN), and about once a second it tries a larger level, whose upscaler is another network that
+# the host runs as it is: agl_ndsr_vr_light 7c511cc23ff85d14 took 59 ms of GPU time a dispatch on a Galaxy S26 Ultra (Adreno 840), 80 to 105 ms a frame against 19 ms at the
+# floor, so the game dropped back, and the frame step went from 2 vsyncs to 3 (2026-11-10). The two cuts make the helper answer count - 1 always: the "under the budget"
+# branch is not taken and the list is not walked. A workaround of the cost of the networks without a stand-in, not a fix of it.
+_floor_res = os.environ.get('DM_OOT_FLOOR_RES', '')
+if _floor_res not in ('', '0', '1'): raise ValueError(f'DM_OOT_FLOOR_RES={_floor_res!r}: 1 holds the dynamic resolution at its lowest level, 0 or unset leaves it off')
+if _floor_res == '1' and _max_res == '1': raise ValueError('DM_OOT_FLOOR_RES=1 and DM_OOT_MAX_RES=1 exclude each other')
+_floor_res_cuts = {
+  'e0f3ccfaf50065ae4ea01eb5aeb13b1a': [
+    (0x806694, '040c0054', '1f2003d5', 'dynamic resolution level: b.mi +0x180 (predicted time under the budget: level 0) -> nop (DM_OOT_FLOOR_RES=1: never the largest level)'),
+    (0x8066b8, 'a00a0054', '55000014', 'dynamic resolution level: b.eq +0x154 (empty level list: count - 1) -> b +0x154 (DM_OOT_FLOOR_RES=1: always the last level)'),
+  ],
+}
+CUTS = _max_res_cuts if _max_res == '1' else _floor_res_cuts if _floor_res == '1' else {}
 
 # The game's frame ratio (ported from seedds/nxnative 7d8dcdf8, MIT; nxnative credits Lichii for finding the division). Once a frame the function at main+0x6e6be0 (v131072)
 # divides its base rate (60.0, or 30.0 while bit 0 of [x21+0x24f] is set: fcsel at +0xe0) by the int frame rate at [x21+0x2c8] (scvtf s0 at +0xc8): fdiv s8,s1,s0 at

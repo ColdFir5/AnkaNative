@@ -2460,7 +2460,8 @@ static void bindless_init(void) {
     g_nsamp_slots = MIN(4096u, HEAD(MIN(p12.maxDescriptorSetUpdateAfterBindSamplers, p12.maxPerStageDescriptorUpdateAfterBindSamplers)));
     g_nimg_slots = MIN(1u << 16, HEAD(MIN(p12.maxDescriptorSetUpdateAfterBindStorageImages, p12.maxPerStageDescriptorUpdateAfterBindStorageImages)));
     // DM_VK_TEX_SLOTS / DM_VK_IMG_SLOTS (default 0: the sizes above): fewer slots for a game whose texture IDs stay low. Every slot is device memory in the driver's
-    // descriptor pool: on Turnip 64 bytes, so the 1M-texture table is 64 MiB and the 64K-image table 4 MiB for the process's life. An ID past the table is reported
+    // descriptor pool: on Turnip 64 bytes, so the 1M-texture table is 64 MiB and the 64K-image table 4 MiB for the process's life; on the Adreno 840
+    // system driver about 256 bytes (VK_EXT_device_memory_report, DM_VK_MEMREPORT: descriptor pools 282 MiB, 34.5 MiB with DM_VK_TEX_SLOTS=65536; 2026-11-10). An ID past the table is reported
     // once (write_tables: "beyond the table") and reads as nothing
     { uint32_t t = (uint32_t)VKA_ENV("DM_VK_TEX_SLOTS", 0), i = (uint32_t)VKA_ENV("DM_VK_IMG_SLOTS", 0);
       if (t) g_ntex_slots = MIN(g_ntex_slots, t);
@@ -2543,7 +2544,13 @@ void mtl_reg_samp(int id, const samp_par *p) {
     if (g_sver) atomic_fetch_add_explicit(&g_sver[id], 1, memory_order_release);
     pthread_mutex_unlock(&g_tmu);
 }
-void mtl_set_tex_pool_n(int n) { (void)n; }
+// The capacity of the game's texture pools together (hle_nvn.c, at each nvnTexturePoolInitialize): the highest texture or image ID there can be is below it. Logged against
+// the bindless tables, whose slots are descriptor memory in the driver whether used or not: what DM_VK_TEX_SLOTS / DM_VK_IMG_SLOTS can be set to for this game
+void mtl_set_tex_pool_n(int n) {
+    static int logged;
+    if (n > logged) { logged = n; VLOG("texture pools: %d IDs in all; the bindless tables have %u texture and %u image slots%s (DM_VK_TEX_SLOTS / DM_VK_IMG_SLOTS)", n, g_ntex_slots, g_nimg_slots,
+                                       !g_ntex_slots ? " (not made yet)" : (uint32_t)n > g_ntex_slots || (uint32_t)n > g_nimg_slots ? ": fewer than the pools' IDs" : ""); }
+}
 
 static VkSamplerAddressMode wrap(int w) {
     switch (w) {

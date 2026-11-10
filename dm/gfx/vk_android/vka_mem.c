@@ -42,7 +42,8 @@ static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pool
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
 // sp: the span buffer the segment's memory is bound into (NULL: none). run, boff: a lookup's answer only (seg_view): where the run from the segment ends, and the
 // segment's offset in the buffer it answers with
-typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs; span_t *sp; uintptr_t run; VkDeviceSize boff; } seg_t;
+// map0, map0_n: where the driver put the memory's first map (place: the copy's vkMapMemory) and its size (stale_map_drop)
+typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs; span_t *sp; uintptr_t run; VkDeviceSize boff; uintptr_t map0; size_t map0_n; } seg_t;
 static seg_t *g_sg; static int g_nsg, g_sgcap;   // sorted by lo, disjoint
 // Bumped (under g_rw for writing) whenever a segment comes or goes: the replay's per-thread lookup cache (vka_addr, vka_addr_run) holds while it stands
 static _Atomic uint64_t g_sg_gen = 1;
@@ -500,6 +501,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow, span_t *sp) {
     swap_begin(lo, hi);
     prot_readonly(pr, npr);   // writers wait in the fault hook from here
     if (!vk.vkMapMemory(V.dev, s.mem, 0, VK_WHOLE_SIZE, 0, &p) && p) {
+        s.map0 = (uintptr_t)p; s.map0_n = (size_t)mr.size;
         copy_readable(p, lo, pr, npr);
         p3 = mono_ns(); g_ph[2] += p3 - p2; p2 = p3;
         vk.vkUnmapMemory(V.dev, s.mem);
@@ -590,6 +592,36 @@ static void detach(int i, segvec *v) {   // caller holds g_pl, and g_rw for writ
 // Memory the GPU is not known to be done with (the wait ran into the hang time, or a GPU hang was declared) is never freed: it stays allocated (leaked) behind the anonymous pages,
 // since a free under work the GPU still runs faults the GPU (freed anyway after 2 s before, on the way to a system restart on the phone)
 // (gpu: the GPU was known to be done, and only the span buffer's unbind did not run: logged by unplace)
+// The driver's first map of a pool's memory, left behind by its vkFreeMemory. A workaround of a driver fault, where the cause cannot be fixed (Adreno 840 system driver
+// 2150932499 on a Galaxy S26 Ultra, 2026-11-10): place maps the memory where the driver likes for the copy, unmaps it, then maps it placed. That driver keeps the first
+// map after vkUnmapMemory, and its vkFreeMemory takes down only the placed one, so the first map stayed, and with it the kernel's memory object: per-process GPU memory
+// (dumpsys gpu --gpumem) grew by a pool's size at every pool finalized, with VK_EXT_device_memory_report saying freed. Ocarina of Time's title screen makes and
+// finalizes a 48.2 MiB and an 8 MiB pool at each loop of its logo video: +56 MiB every 3 s, 560 MiB in 30 s, never given back.
+// Before the free, maps_at reads the placed map's line of /proc/self/maps (its file and offset: the kernel object); after it, a mapping that still starts at map0 with
+// the same file, the same offset and the memory's size is that first map and nothing else (the address was never free in between), and is unmapped here.
+// DM_VK_STALE_MAP=0 (read once; default 1): leave it (the leak as before, to measure it)
+typedef struct { uintptr_t end; unsigned long long off; char path[64]; } mapline;
+static int maps_at(uintptr_t a, mapline *o) {
+    FILE *f = fopen("/proc/self/maps", "r"); if (!f) return 0;
+    char ln[512]; int found = 0;
+    while (!found && fgets(ln, sizeof ln, f)) {
+        unsigned long lo, hi; unsigned long long off; char path[256]; path[0] = 0;
+        if (sscanf(ln, "%lx-%lx %*4s %llx %*s %*s %255s", &lo, &hi, &off, path) < 3 || lo != a) continue;
+        o->end = hi; o->off = off; snprintf(o->path, sizeof o->path, "%s", path); found = 1;
+    }
+    fclose(f); return found;
+}
+static _Atomic uint64_t g_stale_n, g_stale_bytes;
+static int stale_on(void) { static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_STALE_MAP", 1) != 0; return on; }
+static void stale_map_drop(const seg_t *s, const mapline *placed) {
+    if (!s->map0 || !s->map0_n || !placed->path[0] || s->map0 == s->lo) return;
+    mapline m; if (!maps_at(s->map0, &m) || strcmp(m.path, placed->path) || m.off != placed->off || !strstr(m.path, "kgsl")) return;
+    // The first map may be in pieces (a neighbour merged or a protection split it): only the whole memory in one mapping from map0 is taken
+    if (m.end - s->map0 != s->map0_n || munmap((void *)s->map0, s->map0_n)) return;
+    uint64_t k = atomic_fetch_add(&g_stale_n, 1) + 1, b = atomic_fetch_add(&g_stale_bytes, s->map0_n) + s->map0_n;
+    if (k <= 4 || !(k & 63)) VLOG("pool memory %#lx+%#zx freed: the driver left its first map at %#lx (%s offset %#llx); unmapped here, so the kernel frees the memory "
+                                  "(%llu so far, %.1f MiB; DM_VK_STALE_MAP)", (unsigned long)s->lo, (size_t)(s->hi - s->lo), (unsigned long)s->map0, m.path, m.off, (unsigned long long)k, (double)b / 1048576.0);
+}
 static void seg_free(const seg_t *s, int waited, int gpu, uint64_t fence) {
     if (waited) { vk.vkDestroyBuffer(V.dev, s->buf, NULL); vk.vkFreeMemory(V.dev, s->mem, NULL); return; }
     static _Atomic int nk; if (!gpu && atomic_fetch_add(&nk, 1) < 8) VRED("giving back pool memory %#lx+%#zx: the GPU is not known to be done with it (fence %llu%s): its Vulkan memory is kept, not freed",
@@ -615,12 +647,13 @@ static void unplace(const seg_t *sp) {
                 if (o) memcpy(t + (a - s.lo), (const void *)a, 4096);
             }
         }
+    mapline placed = {0}; if (waited && s.map0 && stale_on()) maps_at(s.lo, &placed);   // (stale_map_drop)
     unmap_placed(s.mem);   // the CPU mapping only: the GPU's stays with the allocation
     // DM_VK_UNPLACE_REMAP=1 (experiment, off): map the memory again where the driver likes, so that the address the driver keeps is outside the guest range, then move the
     // pages in before the free (no hole, if the driver's free takes down only its last map). Checked after the free: a range the free took down anyway is [RED]
     void *elsewhere = NULL;
     if (waited && t != MAP_FAILED && VKA_ENV("DM_VK_UNPLACE_REMAP", 0) && (vk.vkMapMemory(V.dev, s.mem, 0, VK_WHOLE_SIZE, 0, &elsewhere) || !elsewhere)) elsewhere = NULL;
-    if (!elsewhere) seg_free(&s, waited, gpu, fence);
+    if (!elsewhere) { seg_free(&s, waited, gpu, fence); if (waited) stale_map_drop(&s, &placed); }
     // Open: from the driver's vkFreeMemory, which takes the range down (above), to this mremap the guest range has a hole, and another thread's mmap(NULL) (the driver's,
     // libc's malloc: calls this library does not see) could be given part of it. The window is the few microseconds between the two calls, and it cannot be closed here:
     // anything mapped into the range before the free (a reservation, these pages) is taken down by the free, and the free cannot wait until after (the bug above). What
@@ -634,7 +667,7 @@ static void unplace(const seg_t *sp) {
         sw_mmap_fixed(s.lo, n);
     }
     if (elsewhere) {
-        vk.vkUnmapMemory(V.dev, s.mem); seg_free(&s, waited, gpu, fence);
+        vk.vkUnmapMemory(V.dev, s.mem); seg_free(&s, waited, gpu, fence); if (waited) stale_map_drop(&s, &placed);
         if (msync((void *)s.lo, n, MS_ASYNC)) {   // the free took the range down after all: the bytes are lost
             static int nr; if (nr++ < 4) VRED("DM_VK_UNPLACE_REMAP: the driver's vkFreeMemory took down pool memory %#lx+%#zx after the anonymous pages moved in: the experiment fails on this driver (the bytes are lost)", (unsigned long)s.lo, n);
             sw_mmap_fixed(s.lo, n);
@@ -1192,6 +1225,53 @@ static int fb_runs(uintptr_t lo, uintptr_t hi, prun *pr, int *npr, vkfb_run *rr,
     for (int i = 0; i < *npr; i++) if (pr[i].prot & PROT_READ) rr[(*nrr)++] = (vkfb_run){pr[i].lo, pr[i].hi};
     return 1;
 }
+// DM_MEM_FILEBACK_PAGEOUT_S=<seconds> (read once; default 0, off): a thread, started with the first pool moved, that every <seconds> asks the kernel to page out what is
+// still mapped from the file (madvise MADV_PAGEOUT, 8 MiB at a time: dirty pages are written to the file, clean ones leave the process's resident memory; a page read
+// again comes back from flash as a major fault). Why: without it the file's pages stay resident until the kernel is short of memory, so the process's resident memory
+// (the footprint line, dumpsys meminfo's PSS) holds the texture storage the CPU reads rarely. Each piece is checked in the table under g_fbmu right before its advice, which
+// is given with the lock held (a placement or a give-back of the piece waits for at most one 8 MiB advice); a range that has become anonymous memory in between would only
+// go to swap, never lose bytes. Each sweep also starts the writeback of what is dirty (sync_file_range), since only clean pages can leave. Logged: the first 12 sweeps and every 32nd (MiB advised, pieces, the range's MiB in the page cache before and after by mincore, advices refused, ms), the first refusal
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+static void *fb_pageout_main(void *arg) {
+    int every = (int)(intptr_t)arg; uint64_t sweeps = 0; int failed = 0;
+    for (;;) {
+        sleep((unsigned)every);
+        uint64_t t0 = mono_ns(), done = 0, res0 = 0, res1 = 0; int pieces = 0, nfail = 0;
+        for (int i = 0;; i++) {
+            pthread_mutex_lock(&g_fbmu);
+            if (i >= g_fb.n) { pthread_mutex_unlock(&g_fbmu); break; }
+            uintptr_t lo = g_fb.p[i].lo, hi = g_fb.p[i].hi;
+            pthread_mutex_unlock(&g_fbmu);
+            pieces++;
+            for (uintptr_t a = lo; a < hi; a += 8u << 20) {
+                uintptr_t b = a + (8u << 20) < hi ? a + (8u << 20) : hi; int in = 0;
+                pthread_mutex_lock(&g_fbmu);
+                for (int j = 0; j < g_fb.n && !in; j++) in = g_fb.p[j].lo <= a && b <= g_fb.p[j].hi;
+                if (in) {
+                    static unsigned char vec[(8u << 20) / VKFB_PG];
+                    if (!mincore((void *)a, b - a, vec)) for (size_t q = 0; q < (b - a) / VKFB_PG; q++) res0 += vec[q] & 1;
+                    if (!madvise((void *)a, b - a, MADV_PAGEOUT)) done += b - a; else { nfail++; if (!failed++) VRED("file-backed pools: page-out advice refused (%s) at %#lx+%#lx", strerror(errno), (unsigned long)a, (unsigned long)(b - a)); }
+                    if (!mincore((void *)a, b - a, vec)) for (size_t q = 0; q < (b - a) / VKFB_PG; q++) res1 += vec[q] & 1;
+                    for (int j = 0; j < g_fb.n; j++) if (g_fb.p[j].lo <= a && b <= g_fb.p[j].hi) { sync_file_range(g_fb_fd, (off64_t)(g_fb.p[j].off + (a - g_fb.p[j].lo)), (off64_t)(b - a), SYNC_FILE_RANGE_WRITE); break; }   // what is dirty now is clean, and droppable, by the next sweep
+                }
+                pthread_mutex_unlock(&g_fbmu);
+                if (!in) break;
+            }
+        }
+        if (++sweeps <= 12 || !(sweeps & 31)) VLOG("file-backed pools: page-out sweep %llu: %.1f MiB advised in %d pieces, in the page cache %.1f -> %.1f MiB, %d advices refused (%.1f ms; DM_MEM_FILEBACK_PAGEOUT_S=%d)", (unsigned long long)sweeps, done / 1048576.0, pieces, res0 * (double)VKFB_PG / 1048576.0, res1 * (double)VKFB_PG / 1048576.0, nfail, (mono_ns() - t0) / 1e6, every);
+    }
+    return NULL;
+}
+static void fb_pageout_start(void) {
+    static _Atomic int started; if (atomic_exchange(&started, 1)) return;
+    const char *e = getenv("DM_MEM_FILEBACK_PAGEOUT_S"); int every = e && *e ? atoi(e) : 0; if (every <= 0) return;
+    pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, fb_pageout_main, (void *)(intptr_t)every)) VRED("file-backed pools: the page-out thread did not start (%s): DM_MEM_FILEBACK_PAGEOUT_S=%d has no effect", strerror(errno), every);
+    else VLOG("file-backed pools: what stays mapped from the file is paged out every %d s (DM_MEM_FILEBACK_PAGEOUT_S)", every);
+    pthread_attr_destroy(&at);
+}
 void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_nvn.c nvnMemoryPoolInitialize, after mtl_pool_add; kind 1 shader code, 2 other
     int k = fb_kinds(); if (!(k & kind) || !size) return;
     if (kind == 2) { static int64_t mb = -1; if (mb < 0) { const char *e = getenv("DM_MEM_FILEBACK_MB"); mb = e && *e ? atoll(e) : 64; } if (size < (uint64_t)mb << 20) return; }
@@ -1248,6 +1328,7 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
              known ? strerror(-r) : "its protections were not read or a page of it is not mapped", lost ? " (the range was taken down by the failed mremap and mapped again from the copy)" : "", st); }
     else if (nlog) VLOG("file-backed pools: pool %#lx+%.1f MiB (%s): %.1f MiB of data moved to the file (%.1f ms); %s", (unsigned long)lo, size / 1048576.0, what, copied / 1048576.0, (mono_ns() - t0) / 1e6, st);
     if (!r) sync_file_range(g_fb_fd, off, (off64_t)size, SYNC_FILE_RANGE_WRITE);   // its dirty pages start to go to flash now (no wait), so they are clean, and droppable, sooner
+    if (!r) fb_pageout_start();
 }
 // A placement replaced [lo, hi) (caller holds g_pl): file-backed pieces there are no longer mapped; their file ranges are punched (the bytes went into the placed memory)
 static void fb_placed(uintptr_t lo, uintptr_t hi) {

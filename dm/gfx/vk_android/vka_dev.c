@@ -67,6 +67,55 @@ uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropert
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 
 static void *completion_main(void *arg);
+// DM_VK_MEMREPORT=1 (restart only: the device's extensions; default off; a diagnostic): the driver reports every allocation it makes for the device, its own ones too
+// (VK_EXT_device_memory_report), and a thread logs every 10 s what is live by object type and heap: "memory report:" lines. Found with it: what the driver holds beyond the
+// memory the host allocates itself (the game's note, "Galaxy S26 Ultra"). The callback runs on any thread, inside the driver: it only updates the table below under its lock
+#define MR_SLOTS (1u << 19)
+#define MR_TYPES 40   // VkObjectType 0..38 by value, 39 every other one
+static struct { uint64_t id, size; uint8_t type, heap, used; } *g_mr;
+static pthread_mutex_t g_mr_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_mr_live[MR_TYPES], g_mr_n[MR_TYPES], g_mr_allocs[MR_TYPES], g_mr_frees[MR_TYPES], g_mr_heap[8], g_mr_failed, g_mr_lost, g_mr_unknown_free, g_mr_freed_b[MR_TYPES], g_mr_big_frees;
+static uint32_t mr_slot(uint64_t id) { return (uint32_t)((id * 0x9e3779b97f4a7c15ull) >> 45) & (MR_SLOTS - 1); }
+static void VKAPI_PTR mr_cb(const VkDeviceMemoryReportCallbackDataEXT *d, void *user) {
+    (void)user; int t = (uint32_t)d->objectType < MR_TYPES - 1 ? (int)d->objectType : MR_TYPES - 1;
+    pthread_mutex_lock(&g_mr_mu);
+    if (d->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT || d->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_IMPORT_EXT) {
+        uint32_t i = mr_slot(d->memoryObjectId), k = 0;
+        for (; k < 256 && g_mr[i].used == 1 && g_mr[i].id != d->memoryObjectId; k++) i = (i + 1) & (MR_SLOTS - 1);
+        if (k == 256) g_mr_lost++;
+        else { if (g_mr[i].used == 1) { g_mr_live[g_mr[i].type] -= g_mr[i].size; g_mr_n[g_mr[i].type]--; g_mr_heap[g_mr[i].heap] -= g_mr[i].size; }   // the id again: replaced
+               g_mr[i].id = d->memoryObjectId; g_mr[i].size = d->size; g_mr[i].type = (uint8_t)t; g_mr[i].heap = (uint8_t)(d->heapIndex & 7); g_mr[i].used = 1;
+               g_mr_live[t] += d->size; g_mr_n[t]++; g_mr_allocs[t]++; g_mr_heap[d->heapIndex & 7] += d->size; }
+    } else if (d->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT || d->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_UNIMPORT_EXT) {
+        uint32_t i = mr_slot(d->memoryObjectId), k = 0;
+        for (; k < 256 && g_mr[i].used && !(g_mr[i].used == 1 && g_mr[i].id == d->memoryObjectId); k++) i = (i + 1) & (MR_SLOTS - 1);
+        if (k == 256 || !g_mr[i].used) g_mr_unknown_free++;
+        else { g_mr_live[g_mr[i].type] -= g_mr[i].size; g_mr_n[g_mr[i].type]--; g_mr_frees[g_mr[i].type]++; g_mr_freed_b[g_mr[i].type] += g_mr[i].size; g_mr_heap[g_mr[i].heap] -= g_mr[i].size; g_mr[i].used = 2;
+               if (g_mr[i].size >= (4u << 20) && g_mr_big_frees++ < 60) LOG("[vk] memory report: freed %.1f MiB of object type %d (one of the first 60 frees of 4 MiB or more)", (double)g_mr[i].size / 1048576.0, (int)g_mr[i].type); }   // 2: a tombstone
+    } else g_mr_failed++;
+    pthread_mutex_unlock(&g_mr_mu);
+}
+static void *mr_main(void *arg) {
+    (void)arg;
+    static const char *const names[MR_TYPES] = {"unknown", "instance", "physical device", "device", "queue", "semaphore", "command buffer", "fence", "device memory", "buffer", "image", "event",
+        "query pool", "buffer view", "image view", "shader module", "pipeline cache", "pipeline layout", "render pass", "pipeline", "set layout", "sampler", "descriptor pool", "descriptor set",
+        "framebuffer", "command pool", [MR_TYPES - 1] = "other"};
+    for (int tick = 1;; tick++) {
+        sleep(10);
+        uint64_t live[MR_TYPES], n[MR_TYPES], al[MR_TYPES], fr[MR_TYPES], fb[MR_TYPES], heap[8], failed, lost, unk, total = 0, freed = 0; char b[1400]; size_t bn = 0; b[0] = 0;
+        pthread_mutex_lock(&g_mr_mu);
+        memcpy(live, g_mr_live, sizeof live); memcpy(n, g_mr_n, sizeof n); memcpy(al, g_mr_allocs, sizeof al); memcpy(fr, g_mr_frees, sizeof fr); memcpy(fb, g_mr_freed_b, sizeof fb); memcpy(heap, g_mr_heap, sizeof heap);
+        failed = g_mr_failed; lost = g_mr_lost; unk = g_mr_unknown_free;
+        pthread_mutex_unlock(&g_mr_mu);
+        for (int t = 0; t < MR_TYPES; t++) { total += live[t]; freed += fb[t];
+            if ((al[t] || n[t]) && bn < sizeof b) bn += (size_t)snprintf(b + bn, sizeof b - bn, "; %s %.1f MiB in %llu (%llu made, %llu freed: %.1f MiB)", names[t] ? names[t] : "?", (double)live[t] / 1048576.0,
+                                                                         (unsigned long long)n[t], (unsigned long long)al[t], (unsigned long long)fr[t], (double)fb[t] / 1048576.0); }
+        VLOG("memory report: at %d s the driver holds %.1f MiB (heap 0: %.1f, heap 1: %.1f), freed so far %.1f MiB%s; %llu failed, %llu not tracked, %llu frees of unknown ids (DM_VK_MEMREPORT)", tick * 10,
+             (double)total / 1048576.0, (double)heap[0] / 1048576.0, (double)heap[1] / 1048576.0, (double)freed / 1048576.0, b, (unsigned long long)failed, (unsigned long long)lost, (unsigned long long)unk);
+    }
+    return NULL;
+}
+
 static int init_once(void) {
     void *lib = vka_driver_open();   // DM_VK_DRIVER: a custom driver through libadrenotools (vka_driver.c); NULL = the system's
     if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -120,7 +169,7 @@ static int init_once(void) {
 
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(V.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(V.pd, NULL, &nde, de);
-    const char *dext[16]; uint32_t ndext = 0;
+    const char *dext[20]; uint32_t ndext = 0;
     { char q[700]; size_t qn = 0; q[0] = 0;   // the vendor's own extensions (tile properties, render pass transforms ...): what a tiler-specific path could use
       for (uint32_t i = 0; i < nde && qn < sizeof q; i++) if (strstr(de[i].extensionName, "_QCOM_")) qn += (size_t)snprintf(q + qn, sizeof q - qn, " %s", de[i].extensionName + 3);
       if (qn) VLOG("device extensions of the vendor:%s", q); }
@@ -147,6 +196,9 @@ static int init_once(void) {
     if (x_mesh) dext[ndext++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
     int x_ph = has_ext(de, nde, "VK_QCOM_queue_perf_hint");
     if (x_ph) dext[ndext++] = "VK_QCOM_queue_perf_hint";
+    const char *mr_env = getenv("DM_VK_MEMREPORT"); int x_mr = mr_env && !strcmp(mr_env, "1") && has_ext(de, nde, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME);
+    if (x_mr && !(g_mr = calloc(MR_SLOTS, sizeof *g_mr))) x_mr = 0;
+    if (x_mr) dext[ndext++] = VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME;
     free(de);
 
     // Every feature the device has, but robustness and capture-replay (they cost and nothing needs them); the shader side takes what it needs from the same device
@@ -160,6 +212,8 @@ static int init_once(void) {
     void *chain = placed ? &fmp : NULL;
 #define LINK(on, st) if (on) { (st).pNext = chain; chain = &(st); }
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
+    VkPhysicalDeviceDeviceMemoryReportFeaturesEXT fmr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_MEMORY_REPORT_FEATURES_EXT};
+    LINK(x_mr, fmr)
     LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
@@ -183,6 +237,9 @@ static int init_once(void) {
     float prio = 1.f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = V.qf, .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = ndext, .ppEnabledExtensionNames = dext};
+    VkDeviceDeviceMemoryReportCreateInfoEXT mrci = {VK_STRUCTURE_TYPE_DEVICE_DEVICE_MEMORY_REPORT_CREATE_INFO_EXT, .pNext = &f2, .pfnUserCallback = mr_cb};
+    if (x_mr && fmr.deviceMemoryReport) { dci.pNext = &mrci; pthread_t th; if (!pthread_create(&th, NULL, mr_main, NULL)) pthread_detach(th); }
+    VLOG("driver memory report (VK_EXT_device_memory_report): %s", x_mr && fmr.deviceMemoryReport ? "on (DM_VK_MEMREPORT=1)" : mr_env && !strcmp(mr_env, "1") ? "asked for, not on this driver" : "off");
     void vka_kgsl_before(int has_ext), vka_kgsl_after(int has_hint); vka_kgsl_before(x_ph);   // the kernel contexts the device's queue gets (the KGSL floor below)
     if ((r = vk.vkCreateDevice(V.pd, &dci, NULL, &V.dev))) { VRED("vkCreateDevice %d", r); return 0; }
 #define D(f) vk.f = (PFN_##f)vk.vkGetDeviceProcAddr(V.dev, #f);
