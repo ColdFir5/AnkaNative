@@ -229,6 +229,8 @@ static treg_seen *g_cap_treg0; static int g_cap_ntreg0; static samp_par *g_cap_s
 static char g_cap_where[96]; static const uint8_t *g_cap_where_base, *g_cap_orig;
 #define CAP_WHERE(base, ...) (snprintf(g_cap_where, sizeof g_cap_where, __VA_ARGS__), g_cap_where_base = (const uint8_t *)(base))
 
+// TEMP (S6 opening holes): DM_TMP_CAP_REL=<s> with DM_NVN_CAPTURE=@<far>:1:<path>: the intro skip's gameplay mark (hle_hid.c) moves the capture to <s> after it
+void vka_cap_arm_rel(void) { const char *e = getenv("DM_TMP_CAP_REL"); if (!e || g_cap_done || g_cap_at_s <= 0) return; g_cap_at_s = (now_ns() - g_t0_ns) / 1e9 + atof(e); CLOG("TEMP: armed for %.1f s", g_cap_at_s); }
 static int nvn_cap_enabled(void) {
     if (g_cap_frame >= 0) return (g_cap_frame > 0 || g_cap_at_s > 0) && !g_cap_done;
     g_cap_frame = 0;

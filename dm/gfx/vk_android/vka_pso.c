@@ -322,7 +322,7 @@ typedef struct {
     VkPipelineVertexInputDivisorStateCreateInfo vds; VkPipelineVertexInputStateCreateInfo vi; VkPipelineInputAssemblyStateCreateInfo ia; VkPipelineTessellationStateCreateInfo ts;
     VkPipelineViewportStateCreateInfo vp; VkPipelineRasterizationStateCreateInfo rs; VkPipelineMultisampleStateCreateInfo ms; VkPipelineDepthStencilStateCreateInfo ds;
     VkPipelineColorBlendAttachmentState cb[8]; VkPipelineColorBlendStateCreateInfo bs; VkDynamicState dyn[24]; VkPipelineDynamicStateCreateInfo dy;
-    VkFormat cf[8]; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci; int tess, mesh;   // mesh: a task / mesh pipeline (pstate_fill)
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc; /* TEMP diagnostic */ VkFormat cf[8]; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci; int tess, mesh;   // mesh: a task / mesh pipeline (pstate_fill)
     VkDescriptorSetLayout set0;   // the layout's set 0 (the library probe's independent-sets layout)
 } pstate;
 
@@ -361,11 +361,14 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
                            : vka_shader_module(s, fs ? k->fs_variant : DMSH_VK_MOD_BASE);
         if (!mod && order[i] == 2 && k->gs_fx) mod = vka_shader_module(s, DMSH_VK_MOD_BASE);   // no module with the claim (logged): the shader as it is
         if (!mod) return 0;
+        // A task or mesh module on a driver that mishandles one with specialization constants: a module with them frozen at this pipeline's values, and no entries
+        VkShaderModule frz = order[i] >= 6 ? vka_shader_frozen_module(s, gl, texfb && (s->e->flags & DMSH_VK_F_TEXFB)) : VK_NULL_HANDLE;
+        if (frz) mod = frz;
         uint32_t n = P->ns++, nse = 0;
         P->sd[n].gl = VK_TRUE; P->sd[n].afunc = P->afunc; P->sd[n].texfb = VK_TRUE;
-        if (gl) P->se[n][nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_GL_DEPTH, 0, sizeof(VkBool32)};
+        if (gl && !frz) P->se[n][nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_GL_DEPTH, 0, sizeof(VkBool32)};
         if (fs && P->afunc && (s->e->flags & DMSH_VK_F_ALPHA_TEST)) P->se[n][nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_ALPHA_FUNC, 4, sizeof(uint32_t)};
-        if (texfb && (s->e->flags & DMSH_VK_F_TEXFB)) P->se[n][nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_TEXFB, 8, sizeof(VkBool32)};
+        if (texfb && (s->e->flags & DMSH_VK_F_TEXFB) && !frz) P->se[n][nse++] = (VkSpecializationMapEntry){DMSH_VK_SPEC_TEXFB, 8, sizeof(VkBool32)};
         P->si[n] = (VkSpecializationInfo){nse, P->se[n], sizeof P->sd[n], &P->sd[n]};
         P->ss[n] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = (VkShaderStageFlagBits)stage_bit(s->e->stage), .module = mod, .pName = "main",
                                                     .pSpecializationInfo = nse ? &P->si[n] : NULL};
@@ -409,6 +412,8 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
     P->ri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor, .pColorAttachmentFormats = P->cf,
                                             .depthAttachmentFormat = (VkFormat)k->dfmt, .stencilAttachmentFormat = (VkFormat)k->sfmt};
     P->tess = !mesh && (sh[3] || sh[4]); P->mesh = mesh;
+    if (mesh && k->gl_depth && V.depth_clip_control && VKA_ENV("DM_VK_MESH_SPEC", 1) >= 4) { static _Atomic int c; if (atomic_fetch_add(&c, 1) < 3) VLOG("TEMP mesh pipeline with depth clip control");   // TEMP diagnostic: the GL clip volume by the rasterizer, the module left unconverted
+        P->dcc = (VkPipelineViewportDepthClipControlCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = VK_TRUE}; P->vp.pNext = &P->dcc; }
     P->ci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &P->ri, .stageCount = P->ns, .pStages = P->ss, .pVertexInputState = mesh ? NULL : &P->vi,
         .pInputAssemblyState = mesh ? NULL : &P->ia,
         .pTessellationState = P->tess ? &P->ts : NULL, .pViewportState = &P->vp, .pRasterizationState = &P->rs, .pMultisampleState = &P->ms, .pDepthStencilState = &P->ds, .pColorBlendState = &P->bs,
@@ -451,6 +456,7 @@ static VkPipeline full_pipeline(pstate *P, vka_shader *const sh[VKA_NSTAGE], con
     VkPipeline p = VK_NULL_HANDLE;
     const vka_shader *pre0 = P->mesh ? sh[7] : sh[0];
     int bslot = build_begin("whole graphics pipeline", pre0 ? pre0->key : 0, sh[1] ? sh[1]->key : 0);
+    if (P->mesh && VKA_ENV("DM_VK_MESH_LOG", 0) >= 2) VLOG("mesh pipeline next: task %016llx mesh %016llx fragment %016llx", sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key, sh[1] ? (unsigned long long)sh[1]->key : 0ull);   // TEMP
     VkResult r = vk.vkCreateGraphicsPipelines(V.dev, g_pc, 1, &P->ci, NULL, &p);
     build_end(bslot);
     P->ci.pNext = fbi.pNext;
@@ -465,7 +471,7 @@ static VkPipeline full_pipeline(pstate *P, vka_shader *const sh[VKA_NSTAGE], con
     const vka_shader *pre = P->mesh ? sh[7] : sh[0];   // the vertex shader, or a mesh pipeline's mesh shader
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("graphics pipeline (%s %016llx fragment %016llx, %u colour targets, topology %u): %d; its draws are skipped", P->mesh ? "mesh" : "vertex",
                                                                          pre ? (unsigned long long)pre->key : 0ull, sh[1] ? (unsigned long long)sh[1]->key : 0ull, P->ri.colorAttachmentCount, P->mesh ? 0u : P->ia.topology, r); }
-    else if (P->mesh) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32) VLOG("mesh pipeline: task %016llx mesh %016llx fragment %016llx, %.1f ms%s", sh[6] ? (unsigned long long)sh[6]->key : 0ull,
+    else if (P->mesh) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32 || ms_ > 200) VLOG("mesh pipeline: task %016llx mesh %016llx fragment %016llx, %.1f ms%s", sh[6] ? (unsigned long long)sh[6]->key : 0ull,
                                                                                       (unsigned long long)sh[7]->key, sh[1] ? (unsigned long long)sh[1]->key : 0ull, ms_, how ? how : ""); }
     else if (ms_ > 50) {
         static _Atomic int n;

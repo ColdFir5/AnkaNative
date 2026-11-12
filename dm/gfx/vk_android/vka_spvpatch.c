@@ -219,6 +219,97 @@ fail:
 #undef FAIL
 }
 
+// vka_spv_subgroup_from_index: a task or mesh module's subgroup built-ins taken from LocalInvocationIndex (a driver workaround, Qualcomm Adreno 840, driver 0x8034a013).
+// The translator's task and mesh modules number a workgroup's 32 invocations (Maxwell's warp) by SubgroupLocalInvocationId and compact their output with
+// SubgroupLtMask and ballots. Measured on the phone with the game's own modules in a standalone mesh pipeline (Ocarina of Time, mesh 25c4a740753e7d7a): in these modules
+// the driver hands every invocation SubgroupLocalInvocationId 0 and SubgroupLtMask 0, while OpGroupNonUniformBallot is right, with the whole workgroup in one subgroup
+// and its bits in LocalInvocationIndex order (a ballot of true 0xffffffff, of "index odd" 0xaaaaaaaa, of "index < 3" 7). So every invocation wrote the outputs of lane 0:
+// garbage triangles. The same built-ins read correctly in modules built by glslc; what in the translated module's form sets the driver off is open (a reduced module
+// that still fails has only the two loads, a ballot and three stores). The rewrite: every load of SubgroupLocalInvocationId loads LocalInvocationIndex, and every load
+// of a subgroup mask (or of a component through an access chain with a constant index) becomes that mask of the index: bit = 1 << (index & 31); eq = bit, lt = bit - 1,
+// le = lt | eq, ge = ~lt, gt = ~le in word 0, and word 1 empty (full for ge and gt). Right only where a workgroup is one subgroup in index order and has at most 32
+// invocations (the index below 32): the caller's to check, which is why vka_shader.c applies it on this driver alone. The masks are kept this plain on purpose: the form
+// that also chose the word by index >> 5 (two selects for each mask) made the driver's shader compiler run out of memory and abort the process in vkCreateGraphicsPipelines
+// on Ocarina of Time's mesh eed1add7c89f5d34; that module's pipeline compiles in 1.4 s untouched and 3.3 s rewritten (compile only, on the phone), why slower is open.
+// A module without the LocalInvocationIndex variable has its SubgroupLocalInvocationId variable decorated as that instead. NULL with err empty when the module reads
+// none of these built-ins
+enum { OpIdxISub = 130, OpIdxShl = 196, OpIdxOr = 197, OpIdxAnd = 199, OpIdxNot = 200, BILocalInvocationIndex = 29 };
+uint32_t *vka_spv_subgroup_from_index(const uint32_t *w, size_t nw, size_t *out_nw, int *changed, char *err, size_t errn) {
+#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
+#define EMIT(...) do { uint32_t x_[] = {__VA_ARGS__}; if (!put_n(&o, x_, sizeof x_ / 4)) FAIL("out of memory"); } while (0)
+    uint8_t *kind = NULL, *chain = NULL; int32_t *cval = NULL; vec_t o = {0}; *changed = 0;   // kind[id]: 1 the id, 2 eq, 3 ge, 4 gt, 5 le, 6 lt; chain[id]: kind | component << 4
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    uint32_t bound = w[3], nb = bound;
+    kind = calloc(bound, 1); chain = calloc(bound, 1); cval = malloc((size_t)bound * 4);
+    if (!kind || !chain || !cval) FAIL("out of memory");
+    for (uint32_t i = 0; i < bound; i++) cval[i] = -1;
+    uint32_t t_u32 = 0, t_v4u = 0, l_var = 0, s_var = 0; size_t first_fn = nw, s_dec = 0; int any = 0, masks = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) FAIL("bad instruction at word %zu", i);
+        if (op == OpDecorate && len >= 4 && w[i + 2] == DecBuiltIn && w[i + 1] < bound) {
+            uint32_t b = w[i + 3], id = w[i + 1];
+            if (b == BILocalInvocationIndex) l_var = id;
+            else if (b == BISubgroupLocalInvocationId) { kind[id] = 1; s_var = id; s_dec = i; any = 1; }
+            else if (b >= BIEq && b <= BILt) { kind[id] = (uint8_t)(2 + b - BIEq); any = masks = 1; }
+        } else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32 && !w[i + 3]) t_u32 = w[i + 1];
+        else if (op == OpTypeVector && len >= 4 && w[i + 3] == 4 && w[i + 2] == t_u32 && t_u32) t_v4u = w[i + 1];
+        else if (op == OpConstant && len >= 4 && w[i + 2] < bound) cval[w[i + 2]] = (int32_t)w[i + 3];
+        else if (op == OpFunction && first_fn == nw) first_fn = i;
+        i += len;
+    }
+    if (!any) { free(kind); free(chain); free(cval); return NULL; }   // nothing to do
+    if (!t_u32) FAIL("no 32-bit unsigned type");
+    if (masks && !t_v4u) FAIL("a subgroup mask without a uvec4 type");
+    int redecorate = 0;
+    if (!l_var) { if (!s_var) FAIL("subgroup masks in a module without LocalInvocationIndex or SubgroupLocalInvocationId"); l_var = s_var; redecorate = 1; kind[s_var] = 0; }
+    uint32_t c0 = nb++, c1 = nb++, c31 = nb++, cff = nb++;
+    if (!put_n(&o, w, 5)) FAIL("out of memory");
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
+        if (i == first_fn) {
+            EMIT(4u << 16 | OpConstant, t_u32, c0, 0, 4u << 16 | OpConstant, t_u32, c1, 1, 4u << 16 | OpConstant, t_u32, c31, 31, 4u << 16 | OpConstant, t_u32, cff, 0xffffffffu);
+        }
+        if (redecorate && i == s_dec) { EMIT(in[0], in[1], in[2], BILocalInvocationIndex); i += len; *changed = 1; continue; }
+        if (i >= first_fn) {
+            if ((op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < bound && kind[w[i + 3]] >= 2) {   // a component of a mask
+                if (len != 5 || w[i + 4] >= bound || cval[w[i + 4]] < 0 || cval[w[i + 4]] > 3) FAIL("an access chain into a subgroup mask with a non-constant index");
+                chain[w[i + 2]] = (uint8_t)(kind[w[i + 3]] | cval[w[i + 4]] << 4);
+                i += len; continue;   // dropped: its loads are computed
+            }
+            if (op == OpLoad && len >= 4 && w[i + 3] < bound && kind[w[i + 3]] == 1) {   // the invocation's id: the index
+                EMIT(4u << 16 | OpLoad, w[i + 1], w[i + 2], l_var);
+                i += len; *changed = 1; continue;
+            }
+            if (op == OpLoad && len >= 4 && w[i + 3] < bound && (kind[w[i + 3]] >= 2 || chain[w[i + 3]])) {
+                int k = chain[w[i + 3]] ? chain[w[i + 3]] & 15 : kind[w[i + 3]], comp = chain[w[i + 3]] ? chain[w[i + 3]] >> 4 : -1;
+                uint32_t L = nb++, sh = nb++, bit = nb++, ltw = nb++, x = nb++, y = k >= 3 && k <= 4 ? cff : c0;   // the index is below 32: word 1 is empty, or full for ge / gt
+                EMIT(4u << 16 | OpLoad, t_u32, L, l_var, 5u << 16 | OpIdxAnd, t_u32, sh, L, c31, 5u << 16 | OpIdxShl, t_u32, bit, c1, sh);
+                if (k == 2) EMIT(4u << 16 | OpCopyObject, t_u32, x, bit);   // eq
+                else {
+                    EMIT(5u << 16 | OpIdxISub, t_u32, ltw, bit, c1);
+                    if (k == 6) EMIT(4u << 16 | OpCopyObject, t_u32, x, ltw);   // lt
+                    else if (k == 3) EMIT(4u << 16 | OpIdxNot, t_u32, x, ltw);   // ge
+                    else { uint32_t le = k == 5 ? x : nb++; EMIT(5u << 16 | OpIdxOr, t_u32, le, ltw, bit); if (k == 4) EMIT(4u << 16 | OpIdxNot, t_u32, x, le); }   // le, gt
+                }
+                if (comp < 0) EMIT(7u << 16 | OpCompositeConstruct, w[i + 1], w[i + 2], x, y, c0, c0);
+                else EMIT(4u << 16 | OpCopyObject, w[i + 1], w[i + 2], comp == 0 ? x : comp == 1 ? y : c0);
+                i += len; *changed = 1; continue;
+            }
+        }
+        if (!put_n(&o, in, len)) FAIL("out of memory");
+        i += len;
+    }
+    o.w[3] = nb;
+    free(kind); free(chain); free(cval);
+    *out_nw = o.n; return o.w;
+fail:
+    free(kind); free(chain); free(cval); free(o.w);
+    return NULL;
+#undef EMIT
+#undef FAIL
+}
+
 // vka_spv_gs_claim: a geometry shader that writes memory, made to write it once per primitive. The Adreno 840 runs a geometry shader several times for each primitive (three
 // times for a triangle in and three vertices out, counted with an atomic add per gl_PrimitiveIDIn), each run executing the whole body: whatever the shader writes to memory
 // is written that many times. Donkey Kong Bananza's terrain culling shader 5d537f7630ec3671 added each surviving triangle 3 times to its chunk's indirect draw record and wrote
@@ -485,6 +576,261 @@ uint32_t *vka_spv_fout_retype(const uint32_t *w, size_t nw, uint32_t umask, uint
     *out_nw = o.n; return o.w;
 fail:
     free(cls); free(loc); free(ty); free(o.w);
+    return NULL;
+#undef FAIL
+}
+
+// vka_spv_mesh_store_planes: a mesh module's calls of the translator's mesh_plane_store, each sent to a copy of it made for the one plane the call can reach.
+// The translator (SpirvMeshEntry.cs) turns each guest store to output memory into mesh_plane_store(word, value): the word address is split into a chunk (32 lanes
+// times the planes), rem = word % chunk, plane = rem >> 5 and a vertex index, followed by one "if (plane == p) output[index].component = value" for every plane (24
+// of them in Ocarina of Time's mesh 4c7d6be5a7717c8d, which calls it 216 times). The address a call passes is (lane part * 4 * chunk + (x & 124) + C) >> 2 with C a
+// constant, so its plane is fixed, but only arithmetic on the lane shows it. Qualcomm's compiler (Adreno 840, driver 0x8034a013) does not see it once the lane is a
+// real value (vka_spv_subgroup_from_index: before it the lane was the constant 0 and every call folded to one store): it keeps the whole chain of variable-index
+// output stores at each call. Measured compile-only on the phone for that module: 7.1 s and 1.7 GB of peak memory, 0.9 s and 126 MB with the calls specialised; in the
+// game the 1.7 GB went through the allocator's large-block path as about 13,000 separate mappings (each with a guard mapping), which with the game's own took the
+// process to the kernel's mapping limit (66,283 lines in /proc/pid/maps): mmap failed, std::bad_alloc on the replay thread in vkCreateGraphicsPipelines, abort.
+// The rewrite finds, for each call, the address as g * t + v with v in lo .. hi (lin_of: constants, add, multiply and shift by a constant, and with a constant mask,
+// and loads of a function's own variable that is only loaded and stored whole, as any of the values stored into it). The plane is known when g is a multiple of the
+// chunk and lo .. hi lies in one plane of it; the call then goes to a copy of the function in which each comparison of the plane with a constant is that constant
+// result. Each scatter of the function (vertex: word % chunk; primitive: (word - base) % chunk) is settled on its own, and a call with none known is left alone. The
+// result differs from the module only for an address past 32 bits (g * t wrapping), which no output has. *changed counts the calls redirected; NULL with err empty
+// when the module has no such function or no call to settle. The better home for this is the translator (a helper per plane, or the stores written in line), whose
+// binary is pinned: open
+enum { OpConstantFalse = 42, OpFunctionCall = 57, OpIAdd = 128, OpIMul = 132, OpUDiv = 134, OpUMod = 137, OpLogicalNot = 168, OpULessThan = 176, OpShiftRightLogical = 194,
+       SCFunction = 7 };
+enum { F_T32 = 1, F_C32 = 2, F_VAR = 4, F_DIRTY = 8 };   // fl[id]: a 32-bit integer type, a constant of one, a Function variable, one used other than by whole loads and stores
+typedef struct { int64_t g, lo, hi; } lin_t;   // the value is g * t + v for some integer t, v in lo .. hi; g = 1 says nothing
+typedef struct { const uint32_t *w; uint32_t bound; const uint32_t *def; const uint8_t *fl; const uint32_t *st; size_t nst; lin_t *memo; uint8_t *state; } lin_ctx;
+static int64_t gcd64(int64_t a, int64_t b) { while (b) { int64_t t = a % b; a = b; b = t; } return a; }
+static lin_t lin_of(lin_ctx *c, uint32_t id, int depth) {
+    const lin_t any = {1, 0, 0}; const int64_t lim = (int64_t)1 << 31;
+    if (id >= c->bound || !c->def[id] || depth > 48 || c->state[id] == 1) return any;   // state 1: a cycle through a variable
+    if (c->state[id] == 2) return c->memo[id];
+    const uint32_t *in = c->w + c->def[id]; uint32_t op = in[0] & 0xffff, len = in[0] >> 16; lin_t r = any;
+#define C32(x) ((x) < c->bound && (c->fl[x] & F_C32) && c->w[c->def[x] + 3] < 0x80000000u)
+#define CV(x) ((int64_t)c->w[c->def[x] + 3])
+    c->state[id] = 1;
+    if (op == OpConstant) { if (C32(id)) r = (lin_t){0, CV(id), CV(id)}; }
+    else if ((op == OpBitcast || op == OpCopyObject) && len == 4) r = lin_of(c, in[3], depth + 1);
+    else if (op == OpLoad && len >= 4) { if (in[3] < c->bound && (c->fl[in[3]] & (F_VAR | F_DIRTY)) == F_VAR) r = lin_of(c, in[3], depth + 1); }
+    else if (op == OpVariable) {   // any of the values stored into it
+        int n = 0;
+        for (size_t k = 0; k < c->nst; k += 2) if (c->st[k] == id) {
+            lin_t p = lin_of(c, c->st[k + 1], depth + 1);
+            if (!n++) r = p; else { r.g = gcd64(r.g, p.g); if (p.lo < r.lo) r.lo = p.lo; if (p.hi > r.hi) r.hi = p.hi; }
+        }
+    }
+    else if (op == OpIAdd && len == 5) { lin_t p = lin_of(c, in[3], depth + 1), q = lin_of(c, in[4], depth + 1); r = (lin_t){gcd64(p.g, q.g), p.lo + q.lo, p.hi + q.hi}; }
+    else if (op == OpIMul && len == 5) {
+        uint32_t k = C32(in[4]) ? in[4] : C32(in[3]) ? in[3] : 0, x = k == in[4] ? in[3] : in[4];
+        if (k) { lin_t p = lin_of(c, x, depth + 1); int64_t m = CV(k); r = (lin_t){p.g * m, p.lo * m, p.hi * m}; }
+    }
+    else if (op == OpIdxShl && len == 5) { if (C32(in[4]) && CV(in[4]) < 31) { lin_t p = lin_of(c, in[3], depth + 1); int64_t m = (int64_t)1 << CV(in[4]); r = (lin_t){p.g * m, p.lo * m, p.hi * m}; } }
+    else if (op == OpIdxAnd && len == 5) { uint32_t k = C32(in[4]) ? in[4] : C32(in[3]) ? in[3] : 0; if (k) r = (lin_t){0, 0, CV(k)}; }
+    else if (op == OpShiftRightLogical && len == 5) {
+        if (C32(in[4]) && CV(in[4]) < 32) { lin_t p = lin_of(c, in[3], depth + 1); int s = (int)CV(in[4]); if (!(p.g & (((int64_t)1 << s) - 1))) r = (lin_t){p.g >> s, p.lo >> s, p.hi >> s}; }
+    }
+    if (r.g > lim || r.lo > lim || r.hi > lim) r = any;
+    c->memo[id] = r; c->state[id] = 2;
+    return r;
+}
+// The plane (rem >> 5) of every address of f in a scatter of chunk ch that starts at word base, -1 when they do not share one
+static int lin_plane(lin_t f, int64_t ch, int64_t base) {
+    if (f.g % ch || f.hi - f.lo >= 32) return -1;
+    int64_t a = ((f.lo - base) % ch + ch) % ch, b = a + (f.hi - f.lo);
+    return b < ch && a >> 5 == b >> 5 ? (int)(a >> 5) : -1;
+}
+// An instruction of mesh_plane_store: 1 with the words that are ids as bits of *ids and the word of its result id (0 none) in *res, 0 for one the copy does not know
+static int plane_fn_op(uint32_t op, uint32_t len, uint32_t *ids, uint32_t *res) {
+    *ids = 0; *res = 0;
+    switch (op) {
+    case OpFunction: if (len != 5) return 0; *ids = 1u << 1 | 1u << 2 | 1u << 4; *res = 2; return 1;
+    case OpLabel: if (len != 2) return 0; *ids = 1u << 1; *res = 1; return 1;
+    case OpSelectionMerge: if (len != 3) return 0; *ids = 1u << 1; return 1;
+    case OpBranch: if (len != 2) return 0; *ids = 1u << 1; return 1;
+    case OpBranchConditional: if (len < 4) return 0; *ids = 7u << 1; return 1;
+    case OpStore: if (len < 3) return 0; *ids = 3u << 1; return 1;
+    case OpReturn: case OpFunctionEnd: return len == 1;
+    case OpFunctionParameter: case OpBitcast: case OpCopyObject: case OpAccessChain: case OpInBoundsAccessChain: case OpIAdd: case OpIdxISub: case OpIMul: case OpUDiv: case OpUMod:
+    case OpLogicalNot: case OpIEqual: case OpULessThan: case OpShiftRightLogical: case OpIdxShl: case OpIdxAnd: case OpIdxOr: case OpSelect:
+        if (len < 3 || len > 31) return 0;
+        *ids = ((1u << len) - 1) & ~1u; *res = 2; return 1;
+    }
+    return 0;
+}
+enum { PLANE_SC = 4 };
+typedef struct { int p[PLANE_SC]; uint32_t id; } plane_var;
+uint32_t *vka_spv_mesh_store_planes(const uint32_t *w, size_t nw, size_t *out_nw, int *changed, char *err, size_t errn) {
+#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
+#define EMIT(...) do { uint32_t x_[] = {__VA_ARGS__}; if (!put_n(&o, x_, sizeof x_ / 4)) FAIL("out of memory"); } while (0)
+    uint32_t *def = NULL, *rm = NULL, *target = NULL; uint8_t *fl = NULL, *state = NULL; lin_t *memo = NULL; plane_var *var = NULL; size_t nvar = 0, cvar = 0;
+    vec_t o = {0}, st = {0}, calls = {0}, defs = {0}; *changed = 0;
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    uint32_t bound = w[3], nb = bound;
+    def = calloc(bound, 4); rm = calloc(bound, 4); fl = calloc(bound, 1); state = calloc(bound, 1); memo = malloc((size_t)bound * sizeof *memo);
+    if (!def || !rm || !fl || !state || !memo) FAIL("out of memory");
+    // Pass 1: the function, the constants, what each id the address arithmetic can use is made by, the stores, the calls
+    uint32_t fn = 0, t_bool = 0, cur = 0; size_t first_fn = nw, fs = 0, fe = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) FAIL("bad instruction at word %zu", i);
+        if (op == OpName && len >= 7 && !fn && !memcmp(w + i + 2, "mesh_plane_store", 17)) fn = w[i + 1];
+        else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32 && w[i + 1] < bound) fl[w[i + 1]] |= F_T32;
+        else if (op == OpTypeBool && len >= 2) t_bool = w[i + 1];
+        else if (op == OpConstant && len == 4 && w[i + 1] < bound && w[i + 2] < bound && (fl[w[i + 1]] & F_T32)) { fl[w[i + 2]] |= F_C32; def[w[i + 2]] = (uint32_t)i; }
+        else if (op == OpFunction && len >= 5) { if (first_fn == nw) first_fn = i; cur = w[i + 2]; if (fn && cur == fn) fs = i; }
+        else if (op == OpFunctionEnd) { if (fn && cur == fn) fe = i + len; cur = 0; }
+        else if (i >= first_fn) {
+            uint32_t scan = 1;   // the first word that makes a variable it names "used otherwise"
+            if (op == OpVariable && len >= 4 && w[i + 2] < bound) { fl[w[i + 2]] |= len == 4 && w[i + 3] == SCFunction ? F_VAR : F_VAR | F_DIRTY; def[w[i + 2]] = (uint32_t)i; scan = len; }
+            else if (op == OpLoad && len >= 4 && w[i + 2] < bound) { def[w[i + 2]] = (uint32_t)i; scan = len; }
+            else if (op == OpStore && len >= 3) { if (!put(&st, w[i + 1]) || !put(&st, w[i + 2])) FAIL("out of memory"); scan = 2; }
+            else if ((op == OpBitcast || op == OpCopyObject || op == OpIAdd || op == OpIMul || op == OpIdxShl || op == OpIdxAnd || op == OpShiftRightLogical) && len >= 4 && w[i + 2] < bound)
+                def[w[i + 2]] = (uint32_t)i;
+            else if (op == OpFunctionCall && len >= 5 && fn && w[i + 3] == fn && cur != fn) { if (!put(&calls, (uint32_t)i)) FAIL("out of memory"); }
+            for (uint32_t k = scan; k < len; k++) if (w[i + k] < bound && (fl[w[i + k]] & F_VAR)) fl[w[i + k]] |= F_DIRTY;   // a literal that happens to be the id only costs the variable
+        }
+        i += len;
+    }
+    if (!fn || !fs || !fe || !calls.n) goto none;
+    if (!t_bool) FAIL("mesh_plane_store without a bool type");
+    // The function: its scatters (the chunk, the first word, the id of the plane) and the ids it makes
+    struct { int64_t ch, base; uint32_t rem, plane; } sc[PLANE_SC]; int nsc = 0, planes = 0;
+    struct { uint32_t id; int64_t base; } sub[PLANE_SC]; int nsub = 0;
+    uint32_t param0 = 0;
+#define K32(x) ((x) < bound && (fl[x] & F_C32))
+    for (size_t i = fs; i < fe;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16, ids, res; const uint32_t *in = w + i;
+        if (!plane_fn_op(op, len, &ids, &res)) FAIL("mesh_plane_store has an instruction the copy does not know (opcode %u)", op);
+        if (res) { if (in[res] >= bound) FAIL("an id past the bound"); if (!put(&defs, in[res])) FAIL("out of memory"); }
+        if (op == OpFunctionParameter && !param0) param0 = in[2];
+        else if (op == OpIdxISub && len == 5 && in[3] == param0 && K32(in[4]) && nsub < PLANE_SC) { sub[nsub].id = in[2]; sub[nsub++].base = w[def[in[4]] + 3]; }
+        else if (op == OpUMod && len == 5 && K32(in[4]) && w[def[in[4]] + 3] >= 32 && w[def[in[4]] + 3] < 0x80000000u && nsc < PLANE_SC) {
+            int64_t base = -1;
+            if (in[3] == param0) base = 0; else for (int k = 0; k < nsub; k++) if (sub[k].id == in[3]) base = sub[k].base;
+            if (base >= 0) { sc[nsc].ch = w[def[in[4]] + 3]; sc[nsc].base = base; sc[nsc].rem = in[2]; sc[nsc++].plane = 0; }
+        }
+        else if (op == OpShiftRightLogical && len == 5 && K32(in[4]) && w[def[in[4]] + 3] == 5)
+            for (int k = 0; k < nsc; k++) if (sc[k].rem == in[3] && !sc[k].plane) { sc[k].plane = in[2]; planes++; }
+        i += len;
+    }
+    if (!param0 || !planes) goto none;
+    // The calls: the planes each can reach, and the copy for them
+    lin_ctx c = {w, bound, def, fl, st.w, st.n, memo, state};
+    if (!(target = calloc(calls.n, 4))) FAIL("out of memory");
+    for (size_t k = 0; k < calls.n; k++) {
+        lin_t f = lin_of(&c, w[calls.w[k] + 4], 0); plane_var v; int known = 0;
+        for (int s = 0; s < PLANE_SC; s++) { v.p[s] = s < nsc && sc[s].plane ? lin_plane(f, sc[s].ch, sc[s].base) : -1; known |= v.p[s] >= 0; }
+        if (!known) continue;
+        size_t j = 0;
+        for (; j < nvar; j++) if (!memcmp(var[j].p, v.p, sizeof v.p)) break;
+        if (j == nvar) {
+            if (nvar == cvar) { size_t n = cvar ? 2 * cvar : 32; plane_var *p = realloc(var, n * sizeof *p); if (!p) FAIL("out of memory"); var = p; cvar = n; }
+            v.id = nb++; var[nvar++] = v;
+        }
+        target[k] = var[j].id; (*changed)++;
+    }
+    if (!nvar) goto none;
+    uint32_t c_true = nb++, c_false = nb++;
+    // Pass 2: the module with the calls redirected and the copies after the function
+    if (!put_n(&o, w, 5)) FAIL("out of memory");
+    size_t ci = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t len = w[i] >> 16;
+        if (i == first_fn) EMIT(3u << 16 | OpConstantTrue, t_bool, c_true, 3u << 16 | OpConstantFalse, t_bool, c_false);
+        if (!put_n(&o, w + i, len)) FAIL("out of memory");
+        if (ci < calls.n && i == calls.w[ci]) { if (target[ci]) o.w[o.n - len + 3] = target[ci]; ci++; }
+        i += len;
+        if (i != fe) continue;
+        for (size_t v = 0; v < nvar; v++) {
+            for (size_t k = 0; k < defs.n; k++) rm[defs.w[k]] = defs.w[k] == fn ? var[v].id : nb++;
+            for (size_t j = fs; j < fe;) {
+                uint32_t op = w[j] & 0xffff, n = w[j] >> 16, ids, res; const uint32_t *in = w + j;
+                plane_fn_op(op, n, &ids, &res);
+                int fold = -1;   // a comparison of a known plane with a constant: its result
+                if (op == OpIEqual && n == 5)
+                    for (int s = 0; s < nsc; s++) if (sc[s].plane && var[v].p[s] >= 0) {
+                        uint32_t k = in[3] == sc[s].plane ? in[4] : in[4] == sc[s].plane ? in[3] : 0;
+                        if (k && K32(k)) fold = w[def[k] + 3] == (uint32_t)var[v].p[s];
+                    }
+                if (fold >= 0) EMIT(4u << 16 | OpCopyObject, in[1], rm[in[2]], fold ? c_true : c_false);
+                else {
+                    if (!put_n(&o, in, n)) FAIL("out of memory");
+                    for (uint32_t k = 1; k < n && k < 32; k++) if ((ids >> k & 1) && in[k] < bound && rm[in[k]]) o.w[o.n - n + k] = rm[in[k]];
+                }
+                j += n;
+            }
+        }
+    }
+    o.w[3] = nb;
+    free(def); free(rm); free(fl); free(state); free(memo); free(var); free(target); free(st.w); free(calls.w); free(defs.w);
+    *out_nw = o.n; return o.w;
+none:
+    *changed = 0;
+fail:
+    free(def); free(rm); free(fl); free(state); free(memo); free(var); free(target); free(st.w); free(calls.w); free(defs.w); free(o.w);
+    return NULL;
+#undef K32
+#undef C32
+#undef CV
+#undef EMIT
+#undef FAIL
+}
+
+// vka_spv_spec_freeze: a module's specialization constants made plain constants of the values a pipeline would give them (a driver workaround, Qualcomm Adreno 840,
+// driver 0x8034a013). Measured on the phone in a standalone mesh pipeline: a mesh module that declares a specialization constant, used or not, specialized by the
+// pipeline or not (a bool or a uint, with or without a SpecId), has SubgroupLocalInvocationId read 0 and SubgroupLtMask read 0 in every invocation, while
+// OpGroupNonUniformBallot and OpGroupNonUniformShuffle stay right. The same module without the constant reads both correctly (lane = LocalInvocationIndex, lt = the bits
+// below it): shown with glslc's modules (one unused "layout(constant_id = 0) const bool" added breaks them) and with Ocarina of Time's mesh 25c4a740753e7d7a, whose only
+// one is the translator's dm_gl_depth (DMSH_VK_SPEC_GL_DEPTH; every one of the game's 495 mesh modules has it, its task modules have none). With the id 0 every
+// invocation of a translated mesh workgroup took itself for lane 0 and wrote lane 0's outputs: garbage triangles. Why the constant does this in the driver is open.
+// The rewrite: each OpSpecConstantTrue / OpSpecConstantFalse / OpSpecConstant (32-bit) whose SpecId is in ids takes vals of the same index (a bool: non-zero is true),
+// the others keep their default; all become OpConstantTrue / OpConstantFalse / OpConstant, OpSpecConstantComposite becomes OpConstantComposite, the SpecId decorations
+// go. An OpSpecConstantOp is not folded here: the module is refused. *changed counts the constants frozen; NULL with err empty when the module has none
+enum { OpSpecConstantTrue = 48, OpSpecConstantFalse = 49, OpSpecConstant = 50, OpSpecConstantComposite = 51, OpSpecConstantOp = 52, DecSpecId = 1 };
+uint32_t *vka_spv_spec_freeze(const uint32_t *w, size_t nw, const uint32_t *ids, const uint32_t *vals, uint32_t n, size_t *out_nw, int *changed, char *err, size_t errn) {
+#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
+    int32_t *sid = NULL; vec_t o = {0}; *changed = 0;   // sid[id]: the id's SpecId, -1 without one
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    uint32_t bound = w[3]; int any = 0;
+    if (!(sid = malloc((size_t)bound * 4))) { snprintf(err, errn, "out of memory"); return NULL; }
+    for (uint32_t i = 0; i < bound; i++) sid[i] = -1;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) FAIL("bad instruction at word %zu", i);
+        if (op == OpDecorate && len >= 4 && w[i + 2] == DecSpecId && w[i + 1] < bound) sid[w[i + 1]] = (int32_t)w[i + 3];
+        else if (op >= OpSpecConstantTrue && op <= OpSpecConstantComposite) any = 1;
+        else if (op == OpSpecConstantOp) FAIL("an OpSpecConstantOp (not folded)");
+        else if (op == OpFunction) break;
+        i += len;
+    }
+    if (!any) { free(sid); return NULL; }   // nothing to do
+    if (!put_n(&o, w, 5)) FAIL("out of memory");
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
+        if (op == OpDecorate && len >= 4 && w[i + 2] == DecSpecId) { i += len; continue; }   // dropped: a plain constant takes none
+        if (op >= OpSpecConstantTrue && op <= OpSpecConstantComposite) {
+            if (len < 3 || w[i + 2] >= bound) FAIL("bad specialization constant at word %zu", i);
+            int given = 0; uint32_t v = 0;
+            for (uint32_t k = 0; k < n; k++) if (sid[w[i + 2]] == (int32_t)ids[k]) { given = 1; v = vals[k]; }
+            if (op == OpSpecConstantComposite) { if (!put(&o, len << 16 | OpConstantComposite) || !put_n(&o, in + 1, len - 1)) FAIL("out of memory"); }
+            else if (op == OpSpecConstant) {
+                if (given && len != 4) FAIL("a specialization constant wider than 32 bits given a value");
+                if (!put(&o, len << 16 | OpConstant) || !put_n(&o, in + 1, len - 1)) FAIL("out of memory");
+                if (given) o.w[o.n - 1] = v;
+            } else {
+                int t = given ? v != 0 : op == OpSpecConstantTrue;
+                if (!put(&o, len << 16 | (uint32_t)(t ? OpConstantTrue : OpConstantFalse)) || !put_n(&o, in + 1, len - 1)) FAIL("out of memory");
+            }
+            ++*changed; i += len; continue;
+        }
+        if (!put_n(&o, in, len)) FAIL("out of memory");
+        i += len;
+    }
+    free(sid);
+    *out_nw = o.n; return o.w;
+fail:
+    free(sid); free(o.w);
     return NULL;
 #undef FAIL
 }

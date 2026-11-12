@@ -164,6 +164,20 @@ def bnsh_shaders(d, base, label):
             if why: red(f'{label} BNSH @{base:#x} variation {v} {st}: {why}')
             if nvn2_ctl(ctl) and len(ctl) > 0x56 and NVN2_CTL_STAGE.get(ctl[0x56]) in ('ts', 'ms'): st = NVN2_CTL_STAGE[ctl[0x56]]   # filed in a graphics slot
             out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
+        # NVN2: the task and mesh stages have slots of their own after the six, program +0x40 (task) and +0x48 (mesh); Ocarina of Time's Foliage and Model bfsha hold
+        # their task and mesh programs only there (the vertex slot is empty), so the six slots alone left them out of the library and the host dropped their draws. An
+        # older BNSH has other fields at those offsets: a slot counts only when it names an NVN2 control section of that stage whose code area is inside the file
+        for off, st in ((0x40, 'ts'), (0x48, 'ms')):
+            if base + prog + off + 8 > len(d): continue
+            sc = struct.unpack_from('<Q', d, base + prog + off)[0]
+            if not sc or base + sc + 0x20 > len(d): continue
+            pctl, pcode, ncode, nctl = struct.unpack_from('<QQII', d, base + sc + 8)
+            ctl = d[base + pctl:base + pctl + nctl]
+            if nctl < 0x68 or len(ctl) != nctl or not nvn2_ctl(ctl) or NVN2_CTL_STAGE.get(ctl[0x56]) != st or base + pcode + ncode > len(d): continue
+            code = d[base + pcode:base + pcode + ncode]
+            why = check(label, st, ctl, code)
+            if why: red(f'{label} BNSH @{base:#x} variation {v} {st}: {why}')
+            out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
     return out
 
 NVN2_CTL_STAGE = {5: 'cs', 6: 'ts', 7: 'ms'}   # NVN2 control +0x56: 0 vertex, 1 pixel, 5 compute, 6 task, 7 mesh

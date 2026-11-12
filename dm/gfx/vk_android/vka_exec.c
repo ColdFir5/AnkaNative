@@ -32,8 +32,49 @@ static int g_origin_ll = 1, g_queue_origin_ll = 1, g_depth_zero;
 _Atomic int vka_synclog_n;   // DM_VK_SYNCLOG: lines left (mtl_wait)
 #define g_synclog vka_synclog_n
 static double ms_now(void) { return (now_ns() % 1000000000000ull) / 1e6; }
-#define RC_PEND 64
-static uint64_t g_rc_ts[RC_PEND]; static int g_nrc_ts;   // timestamp reports replayed in this submission (their counter field reads 0 once written)
+// Counter reports recorded but not written yet (profile render_cond). A report's counter is written when its submission completes (post_run), but a render condition is
+// decided when it is recorded (OP_RENDER_COND), often before the report it reads is written: on the GPU the report comes first, so the condition must see the value the
+// report will hold, not what memory holds now. Each pending report's address keeps the counter post_run will write (0 for a timestamp under render_cond, 1 for samples
+// passed) and how many writes to it are still pending; rc_known reads the table before memory, and post_run takes an entry's count down after writing the memory. Read from
+// memory, a condition over a report from the same or a recent submission read 0 (never written, or cleared) and skipped its draws: Ocarina of Time's first cutscene, whose
+// occlusion conditions compare a samples-passed report with 0, skipped ground, tree and background draws for its first ~10 s (white polygonal holes, changing each frame)
+#define RC_TAB 16384   // a power of two; linear probing; full: the report is not tracked (the condition reads memory, as before)
+static struct { uint64_t addr, val; uint32_t pend; } g_rc_tab[RC_TAB];
+static pthread_mutex_t g_rc_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t rc_counter(uint64_t t) { return t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? 0 : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : 0; }   // under render_cond (post_run)
+static unsigned rc_slot(uint64_t a) { return (unsigned)((a >> 4) * 0x9E3779B97F4A7C15ull >> 40) & (RC_TAB - 1); }
+static int g_rc_n, g_rc_full;   // live entries; reports not tracked because the table was full (under g_rc_mu)
+static int rc_find(uint64_t a) {   // its slot, or -1 - the empty slot the probe ended at (-1 - RC_TAB: full); under g_rc_mu. An empty slot has pend 0
+    unsigned i = rc_slot(a);
+    for (int k = 0; k < RC_TAB; k++, i = (i + 1) & (RC_TAB - 1)) { if (!g_rc_tab[i].pend) return -1 - (int)i; if (g_rc_tab[i].addr == a) return (int)i; }
+    return -1 - RC_TAB;
+}
+static void rc_pend_add(uint64_t a, uint64_t val) {   // the recording thread: a report at a was recorded
+    pthread_mutex_lock(&g_rc_mu);
+    int s = rc_find(a);
+    if (s >= 0) { g_rc_tab[s].val = val; g_rc_tab[s].pend++; }
+    else if (s != -1 - RC_TAB && g_rc_n < RC_TAB * 3 / 4) { s = -1 - s; g_rc_tab[s].addr = a; g_rc_tab[s].val = val; g_rc_tab[s].pend = 1; g_rc_n++; }
+    else if (!g_rc_full++) VRED("more than %d counter reports pending: render conditions over the rest read memory, which may not hold them yet", RC_TAB * 3 / 4);
+    pthread_mutex_unlock(&g_rc_mu);
+}
+static void rc_pend_done(uint64_t a) {   // the completion thread: the report at a was written to memory
+    pthread_mutex_lock(&g_rc_mu);
+    int s = rc_find(a);
+    if (s >= 0 && !--g_rc_tab[s].pend) {   // empty now: move later entries of the probe run back over it (linear probing's deletion), so no probe stops early
+        unsigned i = (unsigned)s, j = i; g_rc_n--;
+        for (;;) {
+            j = (j + 1) & (RC_TAB - 1); if (!g_rc_tab[j].pend) break;
+            unsigned h = rc_slot(g_rc_tab[j].addr);
+            if (((j - h) & (RC_TAB - 1)) >= ((j - i) & (RC_TAB - 1))) { g_rc_tab[i] = g_rc_tab[j]; g_rc_tab[j].pend = 0; i = j; }   // j's home is at or before i: it may move to i
+        }
+    }
+    pthread_mutex_unlock(&g_rc_mu);
+}
+static int rc_pend_get(uint64_t a, uint64_t *v) {
+    pthread_mutex_lock(&g_rc_mu);
+    int s = rc_find(a); if (s >= 0) *v = g_rc_tab[s].val;
+    pthread_mutex_unlock(&g_rc_mu); return s >= 0;
+}
 
 int vka_origin_ll(void) { return __atomic_load_n(&g_origin_ll, __ATOMIC_RELAXED); }
 int vka_queue_origin_ll(void) { return g_queue_origin_ll; }
@@ -129,13 +170,14 @@ static void post_run(void *ops_, int n) {   // the completion thread, in submiss
         if (ops[i].kind == 2 && ops[i].v) {   // a segment timestamp: the completion time less the GPU time from this report to the last
             uint64_t back = (uint64_t)((double)(tmax - gq[q++]) * g_sq_ns); uint64_t tk = nvn_timestamp_from_ns(g > back ? g - back : 0), tt = ops[i].type;
             uint64_t rec[2] = {DM_GAME_RENDER_COND ? 0 : tk, tk}; (void)tt;
-            memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec); continue;
+            memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec); if (DM_GAME_RENDER_COND) rc_pend_done(ops[i].addr); continue;
         }
         if (ops[i].kind == 1) { volatile uint32_t *v = (volatile uint32_t *)(uintptr_t)ops[i].addr; if (ops[i].mode == NVN_EVENT_SIGNAL_MODE_ADD) *v += ops[i].v; else *v = ops[i].v; }
         else {
             // A timestamp report's counter: the time, or 0 under render_cond (as on the GPU, nvn_mtl.m rc_value). Samples passed: 1, so occlusion culling keeps everything visible until draws count
             uint64_t t = ops[i].type, rec[2] = {t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? (DM_GAME_RENDER_COND ? 0 : ticks) : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : 0, ticks};
             memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
+            if (DM_GAME_RENDER_COND) rc_pend_done(ops[i].addr);
         }
     }
     free(ops);
@@ -289,7 +331,7 @@ void vka_rp_sub_begin(void) {
     uint64_t rb_ = RP_T();
     vka_perf_thread(0); vka_ctl_sub();
     { uint64_t f = g_job_frame_set ? g_job_frame : g_frame; if (atomic_load(&g_fstart_f[f % 64]) != f) { atomic_store(&g_fstart[f % 64], now_ns()); atomic_store(&g_fstart_f[f % 64], f); } }
-    g_npost = 0; g_nrc_ts = 0; g_cb = VK_NULL_HANDLE;
+    g_npost = 0; g_cb = VK_NULL_HANDLE;
     if (!vka_init()) { RP_K(RK_BEGIN, rb_); return; }
     vka_gpu_floor();
     if (vka_hung()) { VRED_ONCE("GPU hang: submissions from now on run their effects without the GPU"); RP_K(RK_BEGIN, rb_); return; }   // no command buffer: mtl_sub_commit takes the CPU path
@@ -406,6 +448,8 @@ static uint64_t sub_commit(uint64_t reserved) {
     VkResult r = vk.vkEndCommandBuffer(g_cb);
     g_rec_ns += now_ns() - g_sub_t0;
     g_hrec[fence % NHREC] = (typeof(g_hrec[0])){fence, g_frame, S.serial, g_stat_draws - g_sub_draws0, g_stat_ops - g_sub_ops0, g_stat_skipped - g_sub_skip0, now_ns() - g_sub_t0};
+    { static int tl = -1; static uint64_t tn; if (tl < 0) { const char *e_ = getenv("DM_TMP_FRAMEDRAWS"); tl = e_ ? atoi(e_) : 0; }   // TEMP: per submission: frame, draws, skipped, ops
+      if (tl > 0 && g_stat_draws - g_sub_draws0 >= 50 && tn++ < (uint64_t)tl) VLOG("TMPFD %llu %llu %llu %llu", (unsigned long long)(g_job_frame_set ? g_job_frame : g_frame), (unsigned long long)(g_stat_draws - g_sub_draws0), (unsigned long long)(g_stat_skipped - g_sub_skip0), (unsigned long long)(g_stat_ops - g_sub_ops0)); }
     vka_tex_gw_commit(fence);
     vka_floor_commit(tail);
     { uint64_t r_ = RP_T(); vka_up_flush(); vka_up_throttle(); RP_K(RK_C_UP, r_); }   // before the submission that may use what it made
@@ -770,9 +814,16 @@ static void not_yet(uint32_t op) {
     g_stat_skipped++;
     VRED_ONCE("DrawTexture (op %u) is not on Vulkan yet: skipped from now on", op);
 }
-static int rc_known(uint64_t a, uint64_t *v) {   // a counter at a: 0 for a timestamp report earlier in this submission, else what memory holds now (0 = unknown)
-    for (int i = 0; i < g_nrc_ts; i++) if (g_rc_ts[i] == a) { *v = 0; return 1; }
-    if (!vka_addr(a, 8, NULL, NULL, NULL)) return 0;
+int vka_mem_in_pool(uint64_t a, uint64_t n);
+static int vka_mem_in_pool_(uint64_t a, uint64_t n) { return vka_addr(a, n, NULL, NULL, NULL) || vka_mem_in_pool(a, n); }
+static int rc_known(uint64_t a, uint64_t *v) {   // the counter at a: a pending report's (rc_pend_get), else what memory holds now (0 = unknown)
+    if (rc_pend_get(a, v)) return 1;   // a report recorded earlier and not written yet: the counter it will hold
+    // A counter in a pool not placed yet is still in the guest's memory, where the completion thread wrote it (post): read there too. Only placed memory was read
+    // before, so at a scene's start, while most of its pools were not placed yet, every condition over them read as unknown and its draws were drawn: Ocarina of
+    // Time's first cutscene drew the draws its occlusion results ruled out for its first ~10 s (large holes of sky over the ground, changing each frame)
+    { static int on = -1; if (on < 0) { const char *e_ = getenv("DM_TMP_RC_POOL"); on = !e_ || atoi(e_); }
+      int vka_mem_in_pool(uint64_t a, uint64_t n);
+      if (!vka_addr(a, 8, NULL, NULL, NULL) && !(on && vka_mem_in_pool(a, 8))) return 0; }
     memcpy(v, (const void *)(uintptr_t)a, 8); return 1;
 }
 
@@ -800,14 +851,15 @@ static void exec(const uint8_t *p, int depth) {
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth < 16) exec((const uint8_t *)(uintptr_t)t, depth + 1); else VRED_ONCE("command lists nested deeper than 16"); break; }
         case OP_SIGNAL_EVENT: { uint64_t val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); post((pop){1, m, v, 0, val}); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
+            { static uint64_t tc[32], tn; tc[t & 31]++; if (!(++tn & 4095) && getenv("DM_TMP_RC")) { char b_[300]; int o_ = 0; for (int i_ = 0; i_ < 32; i_++) if (tc[i_]) o_ += snprintf(b_ + o_, sizeof b_ - o_, " type%d:%llu", i_, (unsigned long long)tc[i_]); VLOG("TEMP reports:%s", b_); } }   // TEMP (S6)
             uint32_t q = 0;
             if (g_sqp && g_cb && g_sq_n < SEGQ && (t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP)) {
                 q = (uint32_t)(g_sq_base + g_sq_n++) + 1;
                 struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w = {g_cb, t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q - 1};
                 if (!vka_enc_call(seg_write, &w, sizeof w)) seg_write(&w);
             }
+            if (DM_GAME_RENDER_COND) rc_pend_add(ad, rc_counter(t));   // before post: post_run takes it down once written
             post((pop){2, 0, q, (uint32_t)t, ad});
-            if ((t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP) && DM_GAME_RENDER_COND && g_nrc_ts < RC_PEND) g_rc_ts[g_nrc_ts++] = ad;
             if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0) VLOG("sync report: frame %llu type %llu at draw %llu of the submission, part %d, recording at %.2f ms", (unsigned long long)g_frame,
                                                                            (unsigned long long)t, (unsigned long long)(g_stat_draws - g_sub_draws0), g_nx + 1, ms_now());
             break; }
@@ -815,6 +867,13 @@ static void exec(const uint8_t *p, int depth) {
         case OP_RENDER_COND: { const p_render_cond *rc = a;
             if (rc->mode >= 2) S.rc_skip = rc->mode == 3;
             else { uint64_t x, y; int known = rc_known(rc->addr, &x) && rc_known(rc->addr + 16, &y); S.rc_skip = known && (rc->mode ? x == y : x != y); }
+            { static int tr = -1; if (tr < 0) { const char *e_ = getenv("DM_TMP_RC"); tr = e_ ? atoi(e_) : 0; }   // TEMP (S6): 1 = never skip, 2 = log
+              static uint64_t nset, nskip; nset++; if (S.rc_skip) nskip++;
+              if (tr == 2 && (nset < 40 || !(nset & 1023))) VLOG("TEMP rc: mode %d addr %#llx -> skip %d (%llu of %llu skipped)", rc->mode, (unsigned long long)rc->addr, S.rc_skip, (unsigned long long)nskip, (unsigned long long)nset);
+              if (tr == 3 && rc->mode < 2) { static uint64_t nl3; uint64_t x3 = 0, y3 = 0; int k3 = rc_known(rc->addr, &x3), k4 = rc_known(rc->addr + 16, &y3); uint64_t z3[4] = {0}; if (vka_mem_in_pool_(rc->addr, 32)) memcpy(z3, (const void *)(uintptr_t)rc->addr, 32);
+                if (nl3++ < 3000) VLOG("TEMP rc3 f%llu m%d a%#llx k%d%d x%#llx y%#llx raw %#llx %#llx %#llx %#llx skip %d", (unsigned long long)g_frame, rc->mode, (unsigned long long)rc->addr, k3, k4, (unsigned long long)x3, (unsigned long long)y3, (unsigned long long)z3[0], (unsigned long long)z3[1], (unsigned long long)z3[2], (unsigned long long)z3[3], S.rc_skip); }
+              if (tr == 1 || (tr == 4 && rc->mode < 2)) S.rc_skip = 0;
+              if (tr == 5 && rc->mode < 2) S.rc_skip = 1; }
             break; }
         case OP_RESET_COUNTER: break;
         case OP_CLEAR_BUF: if (g_cb) { const p_clear_buf *cb = a; buf_fill(cb->addr, cb->size, cb->value); vka_barrier(g_cb); } break;

@@ -21,6 +21,7 @@
 import collections, concurrent.futures as cf, hashlib, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shader_split as ss
+from romfs import os, open   # (shader_split.py put dm/tools on the path) a RomFS or main inside a NUP file is read in place, as the split does
 
 CTL_STAGE = {0: 'vertex', 1: 'pixel', 5: 'compute', 6: 'task', 7: 'mesh'}   # control +0x56 (switch2mac's nx2_split.py; agrees with the SPH where there is one)
 NVN2_CTL = ss.CTL_MAGIC + b'\xc9\0\0\0'
@@ -102,7 +103,8 @@ def main():
     jobs.append((mainnso, 'main'))
     print(f'{len(jobs) - 1} RomFS files and main to read', flush=True)
     shaders, loose, bad, hold = {}, [], [], []
-    with cf.ProcessPoolExecutor(int(os.environ.get('J', '8'))) as ex:
+    zd = ss.zs_dicts(rom); ss.ZDICTS = zd   # the RomFS's zstd dictionaries (Pack/ZsDic.pack.zs), for this process (locate) and the pool's, as the split gives them
+    with cf.ProcessPoolExecutor(int(os.environ.get('J', '8')), initializer=ss._pool_init, initargs=(None, {}, zd)) as ex:
         for job, (sh, lo, why) in zip(jobs, ex.map(scan, jobs, chunksize=16)):
             for k, v in sh.items(): shaders.setdefault(k, v)
             loose += lo

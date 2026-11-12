@@ -627,8 +627,35 @@ static void gm_table(uint8_t *p, const uint64_t *lo, const uint64_t *hi, const u
     for (int i = 0; i < k && i + 1 < DMSH_GMEM_MAP_ENTRIES; i++) { uint64_t e[4] = {lo[i], hi[i], bda[i] - lo[i], 0}; memcpy(p + (size_t)(i + 1) * DMSH_GMEM_MAP_ENTRY, e, sizeof e); }
     { vka_table_stats t; vka_mem_table_stats(&t); g_gm_short = t.dropped > 0; }
 }
+// TEMP (S6 opening holes): DM_TMP_GMEM_PLACE=1: before a raw global memory table is built, every memory pool not placed yet is placed (at most every 50 ms), so
+// raw-pointer data in a pool the GPU was never given an address in reaches the table instead of the sink
+static void gm_place_all(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_TMP_GMEM_PLACE"); on = e ? atoi(e) : 0; }
+    if (on <= 0) return;
+    static uint64_t last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (last && now - last < (on == 2 ? 3000000000ull : 50000000ull)) return;
+    last = now;
+    int dm_gfx_unplaced_pools(uint64_t *r, int max); void mtl_pool_need(const void *addr, uint64_t len, const char *why);
+    int nvn_pools_list(uint64_t *mem, uint64_t *size, uint32_t *flags, uint64_t *gen, int max, int *total);
+    static uint64_t r[2 * 8192], pm[8192], ps[8192], pg[8192]; static uint32_t pf[8192];
+    int n = dm_gfx_unplaced_pools(r, 8192); if (n > 8192) n = 8192;
+    if (!n) return;
+    int tot = 0, np = nvn_pools_list(pm, ps, pf, pg, 8192, &tot);
+    uint64_t byf[1024] = {0}; int cnf[1024] = {0}; uint64_t placed = 0; int nplaced = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t fl = 0x3ff; for (int j = 0; j < np; j++) if (r[2 * i] >= pm[j] && r[2 * i] < pm[j] + ps[j]) { fl = pf[j] & 0x3ff; break; }
+        byf[fl] += r[2 * i + 1]; cnf[fl]++;
+        static char want[1024]; static int wset; if (!wset) { wset = 1; const char *w = getenv("DM_TMP_GMEM_FL"); for (const char *q = w; q && *q; ) { char *e_; long v = strtol(q, &e_, 0); if (e_ == q) break; if (v >= 0 && v < 1024) want[v] = 1; q = *e_ ? e_ + 1 : e_; } }
+        if (on == 1 && fl != 0x3ff && want[fl]) {
+            mtl_pool_need((const void *)(uintptr_t)r[2 * i], r[2 * i + 1], "TEMP gmem place"); placed += r[2 * i + 1]; nplaced++; }
+    }
+    static int nl; if (nl++ < 30) { char b[600]; int o = 0; for (int f = 0; f < 1024 && o < 560; f++) if (cnf[f]) o += snprintf(b + o, sizeof b - o, " %#x:%d/%.0fMiB", f, cnf[f], byf[f] / 1048576.0);
+        struct timespec t2; clock_gettime(CLOCK_MONOTONIC, &t2);
+        VLOG("TEMP gmem place: unplaced by pool flags (count/size):%s; placed %d ranges %.1f MiB, %.1f ms", b, nplaced, placed / 1048576.0, ((uint64_t)t2.tv_sec * 1000000000ull + (uint64_t)t2.tv_nsec - now) / 1e6); }
+}
 static int gmem_map(VkDescriptorBufferInfo *bi) {
     size_t n = (size_t)DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY;
+    gm_place_all();   // TEMP (S6)
     gmem_sink_check();
     uint64_t gen = vka_mem_gen();
     atomic_fetch_add_explicit(&g_rch.gm, 1, memory_order_relaxed);
@@ -691,6 +718,7 @@ static int px_alloc(int at, uint64_t recs, int k) {   // a buffer for the table 
     return 1;
 }
 static int gmem_pidx(VkDescriptorBufferInfo *bi) {
+    gm_place_all();   // TEMP (S6)
     gmem_sink_check();
     uint64_t gen = vka_mem_gen();
     atomic_fetch_add_explicit(&g_rch.gm, 1, memory_order_relaxed);
@@ -1498,6 +1526,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     // An NVN2 mesh draw (nvnCommandBufferDrawMeshTasks, hle_nvn.c): the task (optional) and mesh shaders of one program, the fragment stage's shader, in a mesh pipeline
     // (vka_pso.c pstate_fill) drawn with vkCmdDrawMeshTasksEXT: no vertex input, primitive type or index buffer
     const int mesh = dw && dw->prim == NVN_PRIM_MESH;
+    int mcount = mesh ? dw->count : 0, mfirst = mesh ? dw->first : 0;   // a mesh draw's workgroups
     if (mesh) {
         if (!V.mesh) SKIP("mesh draw (nvnCommandBufferDrawMeshTasks) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0): skipped");
         // The program whose task and mesh shaders run: the fragment stage's when it has a mesh shader (a program's stages are bound together), else the one bound at the
@@ -1515,8 +1544,58 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
             SKIP("mesh draw: pixel shader %016llx reads per-primitive inputs that mesh shader %016llx does not write: skipped", (unsigned long long)sh[1]->key, (unsigned long long)sh[7]->key);
         if (sh[1] && !(sh[1]->e->flags & DMSH_VK_F_MESH_PRIM) && (sh[7]->e->flags & DMSH_VK_F_MESH_PRIM))
             VRED_ONCE("mesh draw: mesh shader %016llx writes per-primitive outputs and pixel shader %016llx has no per-primitive inputs: any it reads there are undefined", (unsigned long long)sh[7]->key, (unsigned long long)sh[1]->key);
-        if (dw->first) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("mesh draw with first workgroup %d (count %d): drawn from 0 (the translated task / mesh shaders read their workgroup index with no base; open)", dw->first, dw->count); }
-        if (dw->count <= 0) return;
+        // nvnCommandBufferDrawMeshTasksIndirect: the record at the address is two words, {count, first} (as GL_NV_mesh_shader's DrawMeshTasksIndirectCommandNV, not
+        // VK_EXT_mesh_shader's three group counts: Ocarina of Time's foliage has 131 0 there, and a 0 in the next word, which as Vulkan's y and z would draw nothing). The
+        // game writes it on the CPU before it submits the command buffer, so it is read here, when the draw is replayed, and drawn as a direct draw. Open: a record that
+        // the GPU writes (a compute pass's count) would be read too early; none seen
+        if (dw->ind) {
+            uint32_t w[2] = {0};
+            if (!cpu_read(dw->ind, w, 8)) SKIP("mesh indirect draw arguments at %#llx are not readable: skipped", (unsigned long long)dw->ind);
+            mcount = (int)w[0]; mfirst = (int)w[1];
+            static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("mesh indirect draw: %u workgroups from %u (task %016llx mesh %016llx)", w[0], w[1], sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key);
+        }
+        if (mfirst) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("mesh draw with first workgroup %d (count %d): drawn from 0 (the translated task / mesh shaders read their workgroup index with no base; open)", mfirst, mcount); }
+        if (mcount <= 0) return;
+        if (VKA_ENV("DM_VK_MESH_LOG", 0)) {   // DM_VK_MESH_LOG=1 (a diagnostic): the first mesh draws' buffer bindings, every stage, as the game bound them
+            static _Atomic int n;
+            if (atomic_fetch_add(&n, 1) < 12) {
+                VLOG("mesh draw %s: %d workgroups, task %016llx mesh %016llx pixel %016llx", dw->ind ? "indirect" : "direct", mcount, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key,
+                     sh[1] ? (unsigned long long)sh[1]->key : 0ull);
+                for (int st = 0; st < VKA_NSTAGE; st++) for (int k = 0; k < 2; k++) for (int r = 0; r < 16; r++) {
+                    const vka_range *g = k ? &d->b.ssbo[st][r] : &d->b.ubo[st][r]; if (!g->addr && !g->size) continue;
+                    uint32_t w[4] = {0}; int ok = cpu_read(g->addr, w, 16);
+                    VLOG("  stage %d %s %d: %#llx size %#llx%s first words %08x %08x %08x %08x", st, k ? "storage" : "uniform", r, (unsigned long long)g->addr, (unsigned long long)g->size, ok ? "" : " (NOT READABLE)", w[0], w[1], w[2], w[3]);
+                }
+            }
+        }
+        if (VKA_ENV("DM_VK_MESH_LOG", 0) >= 3) {   // TEMP diagnostic: each mesh shader's first two draws and its 3000th, with the targets and the state they are drawn under
+            static uint64_t keys[64]; static uint32_t cnt[64]; int s = -1;
+            for (int i = 0; i < 64; i++) { if (keys[i] == sh[7]->key || !keys[i]) { keys[i] = sh[7]->key; s = i; break; } }
+            uint32_t c = s >= 0 ? ++cnt[s] : 0;
+            if (c == 1 || c == 2 || c == 3000) {
+                float thr[4] = {0}; const vka_range *g = &d->b.ubo[1][2]; int ok = g->addr ? cpu_read(g->addr + 27 * 16, thr, 16) : 0;
+                VLOG("TEMP mesh state %016llx #%u (pixel %016llx, %d groups): colours %d depth %s; ds test %d write %d func %d stencil %d; alpha func %d ref %g; ms en %d samples %d a2c %d; cull %d front %d mode %d; mask %#x; vp %g %g %g %g range %g %g clamp %d; discard %d; c5[27] %s %g %g %g %g",
+                     (unsigned long long)sh[7]->key, c, sh[1] ? (unsigned long long)sh[1]->key : 0ull, mcount, has_rt ? rt->n : -1, has_rt && rt->depth ? "yes" : "no",
+                     (int)d->ds.dt, (int)d->ds.dw, (int)d->ds.df, (int)d->ds.st, (int)d->color.alpha_func, d->alpha_ref, d->ms.enable, d->ms.samples, d->ms.a2c, (int)d->poly.cull, (int)d->poly.front, (int)d->poly.mode,
+                     d->chmask.mask, d->vp[0][0], d->vp[0][1], d->vp[0][2], d->vp[0][3], d->dr[0], d->dr[1], d->depth_clamp, d->rast_discard, ok ? "=" : "unreadable", thr[0], thr[1], thr[2], thr[3]);
+                if (has_rt) {
+                    for (int i = 0; i < rt->n && i < 8; i++) { const tex_t *t = rt->color[i]; if (t) VLOG("TEMP   colour %d: serial %llu format %#x %ux%ux%u levels %u samples %d target %d; view %d format %#x level %u layers %u+%u", i, (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.samples, t->d.target, rt->has_cview[i], rt->cview[i].format, rt->cview[i].base_level, rt->cview[i].min_layer, rt->cview[i].nlayers); }
+                    if (rt->depth) { const tex_t *t = rt->depth; VLOG("TEMP   depth: serial %llu format %#x %ux%ux%u levels %u samples %d target %d; view %d level %u layers %u+%u", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.samples, t->d.target, rt->has_dview, rt->dview.base_level, rt->dview.min_layer, rt->dview.nlayers); }
+                }
+            }
+        }
+        {   // DM_VK_MESH_SKIP (a diagnostic; restart only): "ind" skips the indirect mesh draws, "dir" the direct ones, a mesh shader's 16-digit key the draws with it
+            static const char *e; static int init; if (!init) { init = 1; e = getenv("DM_VK_MESH_SKIP"); }
+            static int per = -1; if (per < 0) { const char *p = getenv("DM_VK_MESH_CYCLE"); per = p ? atoi(p) : 0; }   // TEMP diagnostic: the list's groups (';' between them) skipped in turn, a period of the wall clock each, then all, then none
+            if (e && *e && per > 0) {
+                char kb[20]; snprintf(kb, sizeof kb, "%016llx", (unsigned long long)sh[7]->key);
+                int ng = 1; for (const char *q = e; *q; q++) if (*q == ';') ng++;
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); int st = (int)((ts.tv_sec / per) % (ng + 2));
+                static int last = -1; if (st != last) { last = st; VLOG("TEMP mesh cycle: state %d of %d at %lld", st, ng + 2, (long long)ts.tv_sec); }
+                const char *hit = strstr(e, kb); if (hit && st <= ng) { int g = 0; for (const char *q = e; q < hit; q++) if (*q == ';') g++; if (st == ng || g == st) return; }
+            } else
+            if (e && *e) { char kb[20]; snprintf(kb, sizeof kb, "%016llx", (unsigned long long)sh[7]->key); if (strstr(e, dw->ind ? "ind" : "dir") || strstr(e, kb)) return; }
+        }
         if (d->tf_on) VRED_ONCE("transform feedback with a mesh draw: drawn without capture");
     } else {
         for (int st = 0; st < 5; st++) if (!resolve(d->bst[st], st, &sh[st], &bad)) SKIP("draw skipped: no shader library");
@@ -1534,7 +1613,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (expand < 0) SKIP("primitive type %d not on Vulkan: the draw is skipped", prim);
         if (topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) SKIP("tessellation patches are not on Vulkan yet (no patch size is recorded): the draw is skipped");
     }
-    uint64_t ind = dw ? dw->ind : di->ind;
+    uint64_t ind = mesh ? 0 : dw ? dw->ind : di->ind;   // (an indirect mesh draw's count is read above: a direct draw from here on)
     // A geometry shader that writes memory makes those writes in the run that claims its primitive (vka_spv_gs_claim): a zeroed word per primitive at VKA_GS_CLAIM_BINDING.
     // Primitive IDs restart with each instance and an indirect draw's count is the GPU's, so those draws take the shader as it is (each run writing)
     g_claim_words = 0;
@@ -1683,7 +1762,10 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     int hd = R.df != VK_FORMAT_UNDEFINED, hs = R.sf != VK_FORMAT_UNDEFINED;
     DY_SET1(dt, (uint32_t)(hd && d->ds.dt), vk.vkCmdSetDepthTestEnable(g_cb, DY.dt));
     DY_SET1(dw, (uint32_t)(hd && d->ds.dt && d->ds.dw), vk.vkCmdSetDepthWriteEnable(g_cb, DY.dw));
-    DY_SET1(dc, (uint32_t)(d->ds.df >= 1 && d->ds.df <= 8 ? (VkCompareOp)(d->ds.df - 1) : VK_COMPARE_OP_ALWAYS), vk.vkCmdSetDepthCompareOp(g_cb, DY.dc));
+    // TEMP diagnostic (DM_VK_EQ_BIAS=n; n + 1000 for every draw, not only mesh ones; n + 2000 for mesh draws with no slope part): a mesh draw testing depth EQUAL without writing it (a G-buffer pass over a depth pre-pass drawn by another mesh shader)
+    // tests LESS_OR_EQUAL with a depth bias of -n units toward the viewer, so a pass whose depth differs from the pre-pass in the last bits still lands
+    int eqb = 0; { static int eqn = -1; if (eqn < 0) eqn = (int)VKA_ENV("DM_VK_EQ_BIAS", 0); if (eqn > 0 && (mesh || (eqn >= 1000 && eqn < 2000)) && hd && d->ds.dt && !d->ds.dw && d->ds.df == 3) eqb = eqn >= 2000 ? eqn : eqn >= 1000 ? eqn - 1000 : eqn; }
+    DY_SET1(dc, (uint32_t)(eqb ? VK_COMPARE_OP_LESS_OR_EQUAL : d->ds.df >= 1 && d->ds.df <= 8 ? (VkCompareOp)(d->ds.df - 1) : VK_COMPARE_OP_ALWAYS), vk.vkCmdSetDepthCompareOp(g_cb, DY.dc));
     DY_SET1(dbt, (uint32_t)(VK_FALSE), vk.vkCmdSetDepthBoundsTestEnable(g_cb, DY.dbt));
     DY_SET1(stt, (uint32_t)(hs && d->ds.st), vk.vkCmdSetStencilTestEnable(g_cb, DY.stt));
     for (int i = 0; i < R.nw; i++) if (R.wslot[i] < 0 ? DY.dw || DY.stt : k.att[R.wslot[i]].mask != 0) vka_rtw(R.wim[i], VKA_RTW_DRAW);   // (DM_VK_RTWATCH_MB: a draw with writes on)
@@ -1698,9 +1780,9 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
                          vk.vkCmdSetStencilWriteMask(g_cb, VK_STENCIL_FACE_FRONT_BIT, sm[2]), vk.vkCmdSetStencilWriteMask(g_cb, VK_STENCIL_FACE_BACK_BIT, sm[3]),
                          vk.vkCmdSetStencilReference(g_cb, VK_STENCIL_FACE_FRONT_BIT, sm[4]), vk.vkCmdSetStencilReference(g_cb, VK_STENCIL_FACE_BACK_BIT, sm[5]))); }
     int bias_bit = d->poly.mode == NVN_POLYGON_MODE_POINT ? NVN_POLYGON_OFFSET_ENABLE_POINT : d->poly.mode == NVN_POLYGON_MODE_LINE ? NVN_POLYGON_OFFSET_ENABLE_LINE : NVN_POLYGON_OFFSET_ENABLE_FILL;
-    int bias = (d->poly.offset_en & bias_bit) != 0;
+    int bias = (d->poly.offset_en & bias_bit) != 0 || eqb;
     DY_SET1(dbe, (uint32_t)(bias), vk.vkCmdSetDepthBiasEnable(g_cb, DY.dbe));
-    { float db[3] = {bias ? d->po.units : 0, bias && V.depth_bias_clamp ? d->po.clamp : 0, bias ? d->po.factor : 0}; DY_SET(db, db, vk.vkCmdSetDepthBias(g_cb, db[0], db[1], db[2])); }
+    { float db[3] = {eqb ? -(float)(eqb >= 2000 ? eqb - 2000 : eqb) : bias ? d->po.units : 0, eqb ? 0 : bias && V.depth_bias_clamp ? d->po.clamp : 0, eqb ? (eqb >= 2000 ? 0.0f : -1.0f) : bias ? d->po.factor : 0}; DY_SET(db, db, vk.vkCmdSetDepthBias(g_cb, db[0], db[1], db[2])); }
     DY_SET1(rd, (uint32_t)(d->rast_discard != 0), vk.vkCmdSetRasterizerDiscardEnable(g_cb, DY.rd));
     DY_SET(bc, d->blend_color, vk.vkCmdSetBlendConstants(g_cb, d->blend_color));
     if (!DY.valid) vk.vkCmdSetLineWidth(g_cb, 1.0f);
@@ -1712,12 +1794,12 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     PT(7);
     // The draw
     uint32_t inst = (uint32_t)((dw ? dw->instances : di->instances) > 0 ? (dw ? dw->instances : di->instances) : 1), binst = d->b.base_instance;
-    if (vka_gp_split) vka_gp_draw(g_cb, p, mesh ? (sh[7] ? sh[7]->key : 0) : sh[0] ? sh[0]->key : 0, fs ? fs->key : 0, ind ? 0 : (uint64_t)(uint32_t)(dw ? dw->count : di->count) * inst, ind != 0);   // DM_VK_GPUPROF_SPLIT
+    if (vka_gp_split) vka_gp_draw(g_cb, p, mesh ? (sh[7] ? sh[7]->key : 0) : sh[0] ? sh[0]->key : 0, fs ? fs->key : 0, ind ? 0 : (uint64_t)(uint32_t)(mesh ? mcount : dw ? dw->count : di->count) * inst, ind != 0);   // DM_VK_GPUPROF_SPLIT
     if (mesh) {   // count workgroups of the task shader, or of the mesh shader without one (the device's limit per dimension: maxTaskWorkGroupCount / maxMeshWorkGroupCount, 65535 on the Adreno 840)
-        static uint32_t largest; if ((uint32_t)dw->count > largest) { largest = (uint32_t)dw->count; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("mesh draw: largest so far %u workgroups (task %016llx mesh %016llx)", largest, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key); }
+        static uint32_t largest; if ((uint32_t)mcount > largest) { largest = (uint32_t)mcount; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("mesh draw: largest so far %u workgroups (task %016llx mesh %016llx)", largest, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key); }
         uint32_t maxg = sh[6] ? V.task_groups : V.mesh_groups;
-        if ((uint32_t)dw->count > maxg) SKIP("mesh draw of %d workgroups: more than the device's %u in one dimension; skipped", dw->count, maxg);
-        vk.vkCmdDrawMeshTasksEXT(g_cb, (uint32_t)dw->count, 1, 1);
+        if ((uint32_t)mcount > maxg) SKIP("mesh draw of %d workgroups: more than the device's %u in one dimension; skipped", mcount, maxg);
+        vk.vkCmdDrawMeshTasksEXT(g_cb, (uint32_t)mcount, 1, 1);
     } else if (expand) {   // quads or a line loop: the indices made here, 32-bit, in scratch memory
         uint32_t count = (uint32_t)(dw ? dw->count : di->count), *src = NULL;
         if (di && !(src = read_indices(di->ibuf, di->itype, count))) SKIP("indices at %#llx are not readable: the draw is skipped", (unsigned long long)di->ibuf);

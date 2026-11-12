@@ -529,6 +529,11 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = (uint32_t)nfl, .pViewFormats = fls};
     VkImageCreateFlags fl = alt || im->nx || (!ubwc && f->kind < 3) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     im->alt = ubwc ? alt : VK_FORMAT_UNDEFINED; im->any_fmt = !ubwc && f->kind < 3;
+    // A shader image over a colour format that has no storage use of its own (RGB9E5: Ocarina of Time's AA pass a335c1db6270c355 writes its 683x384 target through an
+    // R32_UINT view): storage use through a listed view format that has it (EXTENDED_USAGE: the image's own format need not support every usage, its views do; view_usage
+    // leaves storage out of the views in the image's own format). Without it the binding read as unbound and the whole picture came out dark in false colours
+    if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && !(u & VK_IMAGE_USAGE_STORAGE_BIT) && f->kind < 3 && !compressed(f) && (fl & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+        for (int k = 0; k < nfl; k++) if (fls[k] && fls[k] != f->vk && (feats(fls[k]) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { u |= VK_IMAGE_USAGE_STORAGE_BIT; fl |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; break; }
     if (!res && !is3d && !is1d && im->w == im->h && im->layers >= 6 && im->layers % 6 == 0 && im->samples == 1) fl |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     uint32_t rtw = 0, rth = 0, rtd = 0; int ntl = res ? nvn_tex_sparse_tiles(d, &rtw, &rth, &rtd) : 0;
     if (res) {   // the format takes sparse residency at this shape, with the usage it would have (storage use dropped: sampled sparse textures have none)
@@ -2200,7 +2205,7 @@ VkImageView vka_view(vka_img *im, VkFormat fmt, VkImageViewType type, VkImageAsp
             if (pv != &VIEWS(im)) { *pv = v->next; v->next = VIEWS(im); VIEWS(im) = v; }
             pthread_mutex_unlock(&g_tmu); return v->v; }
     // A view in another format: the uses its format takes (view_usage)
-    VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = fmt != im->f.vk ? view_usage(im->usage, fmt) : im->usage};
+    VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = view_usage(im->usage, fmt)};   // (own format too: an EXTENDED_USAGE image's own format may lack its storage use
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = vu.usage != im->usage ? &vu : NULL, .image = im->img, .viewType = type, .format = fmt, .components = *swz, .subresourceRange = {asp, level, nlevels, layer, nlayers}};
     VkImageView view = VK_NULL_HANDLE; VkResult r = vk.vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("image view of serial %llu format %d type %d levels %u+%u layers %u+%u: %d", (unsigned long long)im->serial, fmt, type, level, nlevels, layer, nlayers, r); }
@@ -2637,6 +2642,8 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
 }
 
 // DM_VK_IMG_UPGRADE=0: no image intent from a binding: made and kept without storage use, the binding reads as unbound (as before); live
+// storage_able for an image whose own format has no storage use, through a view format that has (img_create: EXTENDED_USAGE)
+static int storage_able_as(const vka_img *im, VkFormat f) { return !im->no_storage && !im->rs && VKA_ENV("DM_VK_IMG_UPGRADE", 1) && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind < 3 && (feats(f) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT); }
 static int storage_able(const vka_img *im) { return !im->no_storage && !im->rs && VKA_ENV("DM_VK_IMG_UPGRADE", 1) && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && (feats(im->f.vk) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT); }
 // A texture made without NVN's IMAGE flag and then bound to a shader image slot (nvn_mtl.m image_prepare: the binding is the image intent; some engines register a texture with
 // RegisterTexture and use its handle in an image slot). Its image was made without storage use (img_create), so the shader's writes went nowhere and what read the texture
@@ -2646,7 +2653,7 @@ static int storage_able(const vka_img *im) { return !im->no_storage && !im->rs &
 // want: a view format the image's list must take (img_alias_view: a format just learned for it), remade for it even with storage use; VK_FORMAT_UNDEFINED = storage use only
 static int img_remake(vka_img *im, VkCommandBuffer cb, VkFormat want) {
     if ((im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && (!want || img_lists(im, want))) return 1;
-    if (!cb || !storage_able(im) || im->holds) return 0;
+    if (!cb || im->holds || !(storage_able(im) || (want && storage_able_as(im, want)))) return 0;
     tex_t t = {0}; t.serial = im->serial; t.mem = im->mem; t.d = im->d; t.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; t.L = im->L;
     vka_img *n = img_create(&t, &im->f, im->base);
     if (!n) return 0;
@@ -2785,7 +2792,8 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     if (!storage && im->m.size >= big_min()) { pthread_mutex_lock(&g_tmu); im->nsamp++; pthread_mutex_unlock(&g_tmu); }   // (DM_VK_BIGIMG_MB: bound for sampling)
     vka_rtw(im, storage ? VKA_RTW_STORE : VKA_RTW_SAMPLE);   // (DM_VK_RTWATCH_MB)
     if (!storage) im->rl_sf = (uint32_t)vka_frame();   // (DM_VK_RTLOG_MB: its last binding for sampling)
-    if (storage && !(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { pthread_mutex_lock(&g_tmu); int ok = img_storage_upgrade(im, cb); pthread_mutex_unlock(&g_tmu); if (!ok) return VK_NULL_HANDLE; }
+    // (a format with no storage use of its own goes on: the alias step below may remake the image with a view format that has it, img_create's EXTENDED_USAGE)
+    if (storage && !(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { pthread_mutex_lock(&g_tmu); int ok = img_storage_upgrade(im, cb); pthread_mutex_unlock(&g_tmu); if (!ok && (feats(im->f.vk) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return VK_NULL_HANDLE; }
     // Bound as a shader image: the GPU writes it (nvn_mtl.m mtl_tex_gpu_owned: ShaderWrite usage), so its storage is no longer its content. Without this a CPU write near a
     // tracked image's pages re-uploaded stale storage over what a compute pass wrote (DKB's 1x1 R16F texture, re-uploaded in the level)
     if (storage) vka_img_written(im);
@@ -2798,6 +2806,20 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     // view of a B10G11R11 image passed this check (the image's class) and got the R32_UINT view under DM_VK_UBWC=0, which shows Ocarina of Time's gameplay picture.
     // The sampled type then differs from the view's class (undefined in Vulkan, as it always was under DM_VK_UBWC=0); refusing it would unbind that write once the pair
     // is learned (open: the declared class is the translator's, which does not know the format)
+    // A storage binding over an image whose own format has no storage use, registered with a view format that has it (RGB9E5 through R32_UINT, a335c1db6270c355 binding 3,
+    // declared float by the translator so the class step below leaves it): that format is learned and the image remade with it in its list (img_create: EXTENDED_USAGE)
+    if (storage && !(im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && e.has_v && e.v.set_format && !(feats(im->f.vk) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        vka_fmt sf;
+        if (vka_fmt_of(e.v.format, &sf) && sf.kind < 3 && sf.vk != im->f.vk && storage_able_as(im, sf.vk)) {
+            pthread_mutex_lock(&g_tmu);
+            if (!img_lists(im, sf.vk)) view_unlisted(im, sf.vk, "the image is remade with it in its format list (storage use through it)");
+            VkFormat x[VL_PER_IMAGE]; pthread_mutex_lock(&g_vlmu); int nx = vl_formats(im->f.vk, im->w, im->h, x, VL_PER_IMAGE); pthread_mutex_unlock(&g_vlmu);
+            int lt = 0; for (int k = 0; k < nx; k++) lt |= x[k] == sf.vk;
+            if (lt && vka_rp_open()) im->relist = sf.vk;   // (copies outside the pass: the next draw that binds it ends the pass first)
+            else if (lt) { im->relist = VK_FORMAT_UNDEFINED; img_remake(im, cb, sf.vk); }
+            pthread_mutex_unlock(&g_tmu);
+        }
+    }
     int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = im->f.kind == 1 ? 1 : im->f.kind == 2 ? 2 : 0;
     // Storage bindings (DM_VK_IMG_ALIAS, default on): a format the list lacks is learned and the image remade with it in its list (img_remake: MUTABLE_FORMAT), so the
     // first binding already writes it instead of reading as unbound for the image's life.
@@ -2827,6 +2849,7 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     if (want != have && !(im->f.kind >= 3 && want == 0)) return VK_NULL_HANDLE;
     if (imo) *imo = im;
     if (r32) { if (!e.has_v) { memset(&e.v, 0, sizeof e.v); e.has_v = 1; } e.v.set_format = 1; e.v.format = want == 1 ? 0x0B : 0x0C; }   // (NVN R32_UI / R32_I: view_of's format)
+    if (storage && !(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return VK_NULL_HANDLE;
     return view_of(&e, im, vt, storage);
 }
 vka_img *vka_tex_id_img(int id, VkCommandBuffer cb) {   // the image of texture ID id (DM_VK_NANSCAN), NULL = none
@@ -2915,7 +2938,7 @@ int vka_tex_id_target(int id) {
 int vka_tex_id_storage_pending(int id) {
     pthread_mutex_lock(&g_tmu);
     smap_ent *e = id > 0 && id < g_ntreg && g_treg[id].t.serial ? map_get(g_treg[id].t.serial) : NULL;
-    int r = e && e->im && (((!(e->im->usage & VK_IMAGE_USAGE_STORAGE_BIT) || (e->im->relist && !img_lists(e->im, e->im->relist))) && storage_able(e->im) && !e->im->holds) || e->im->m.z || e->im->mdrop);   // (mdrop: made whole outside the pass)   // (a zero-shared image gets memory of its own: outside the pass too)
+    int r = e && e->im && (((!(e->im->usage & VK_IMAGE_USAGE_STORAGE_BIT) || (e->im->relist && !img_lists(e->im, e->im->relist))) && (storage_able(e->im) || (e->im->relist && storage_able_as(e->im, e->im->relist))) && !e->im->holds) || e->im->m.z || e->im->mdrop);   // (mdrop: made whole outside the pass)   // (a zero-shared image gets memory of its own: outside the pass too)
     pthread_mutex_unlock(&g_tmu);
     return r;
 }

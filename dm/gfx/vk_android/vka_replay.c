@@ -153,6 +153,7 @@ static void fill_tex(const uint8_t *d, size_t n) {
     cap_tsub *subs; uint64_t total; uint32_t ns = vcap_subs(im, &subs, &total);
     if ((uint32_t)im->f.vk != h.pixfmt || im->w != h.width || im->h != h.height || im->levels != h.levels || im->layers != h.slices || ns != h.nsub) {
         vcap_cb_run(cb);
+        if (getenv("DM_REPLAY_LAX")) { printf("TEMP lax: texture ser=%llu captured as VkFormat %u, made as %d: not filled\n", (unsigned long long)h.t.serial, h.pixfmt, im->f.vk); return; }   // TEMP diagnostic
         RFAIL("texture ser=%llu: captured as %ux%u VkFormat %u, %u levels, %u layers; this build makes it %ux%u VkFormat %d, %u levels, %u layers (the replay's image creation changed)",
               (unsigned long long)h.t.serial, h.width, h.height, h.pixfmt, h.levels, h.slices, im->w, im->h, im->f.vk, im->levels, im->layers);
     }

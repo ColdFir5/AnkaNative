@@ -343,6 +343,7 @@ void dm_skip_frame(uint64_t draws) {   // each present, with the frame's draws (
     LOG("DM_SKIP: gameplay: 5 frames in a row with %ld draws or more (%llu now), %.2f s after the skip began; off in %.0f s", g_skip_draws, (unsigned long long)draws,
         (now - atomic_load(&g_skip_since)) / 1e9, g_skip_tail);
     atomic_store(&g_skip_tail_at, now + (uint64_t)(g_skip_tail * 1e9) + 1);
+    { extern void vka_cap_arm_rel(void) __attribute__((weak)); if (vka_cap_arm_rel) vka_cap_arm_rel(); }   // TEMP (S6)
 }
 // Player 1's physical buttons with the combination taken out (fill): Minus+Plus held 1 s toggles the skip; from the moment both are down until both are up neither is reported
 static uint64_t skip_combo(uint64_t b) {

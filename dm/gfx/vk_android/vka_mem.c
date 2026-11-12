@@ -1153,6 +1153,14 @@ void mtl_pool_del(const void *mem) {
     atomic_fetch_add(&g_give_ns, mono_ns() - t0);
     fb_gone((uintptr_t)mem, (uintptr_t)mem + e.size, 1);
 }
+// Whether [a, a+n) lies in one live memory pool, placed or not (vka_exec.c rc_known): a pool not placed yet is still the guest's memory, which the CPU reads and the
+// completion thread writes counter reports into
+int vka_mem_in_pool(uint64_t a, uint64_t n) {
+    pthread_mutex_lock(&g_pmu);
+    int in = 0; for (int i = 0; i < g_npool && !in; i++) in = g_pool[i].mem && a >= g_pool[i].mem && a + n <= g_pool[i].mem + g_pool[i].size;
+    pthread_mutex_unlock(&g_pmu);
+    return in;
+}
 // The live memory pools (the frame capture's regions, vka_capture.c): at most max of them, the count returned
 int vka_pools(uint64_t *lo, uint64_t *size, int max) {
     pthread_mutex_lock(&g_pmu);

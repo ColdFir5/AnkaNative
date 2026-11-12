@@ -194,6 +194,8 @@ static int init_once(void) {
     int mesh_ext = has_ext(de, nde, VK_EXT_MESH_SHADER_EXTENSION_NAME); const char *mesh_env = getenv("DM_VK_MESH");   // restart only: the device's extensions
     int x_mesh = mesh_ext && !(mesh_env && !strcmp(mesh_env, "0"));
     if (x_mesh) dext[ndext++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+    int x_dcc = has_ext(de, nde, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);   // TEMP diagnostic (DM_VK_MESH_SPEC=4)
+    if (x_dcc) dext[ndext++] = VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME;
     int x_ph = has_ext(de, nde, "VK_QCOM_queue_perf_hint");
     if (x_ph) dext[ndext++] = "VK_QCOM_queue_perf_hint";
     const char *mr_env = getenv("DM_VK_MEMREPORT"); int x_mr = mr_env && !strcmp(mr_env, "1") && has_ext(de, nde, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME);
@@ -213,7 +215,9 @@ static int init_once(void) {
 #define LINK(on, st) if (on) { (st).pNext = chain; chain = &(st); }
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
     VkPhysicalDeviceDeviceMemoryReportFeaturesEXT fmr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_MEMORY_REPORT_FEATURES_EXT};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};   // TEMP diagnostic
     LINK(x_mr, fmr)
+    LINK(x_dcc, fdcc)
     LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
@@ -231,6 +235,7 @@ static int init_once(void) {
     V.divisor = x_div && fdiv.vertexAttributeInstanceRateDivisor; V.logic_op = f2.features.logicOp; V.dual_src = f2.features.dualSrcBlend; V.geom = f2.features.geometryShader;
     V.tess = f2.features.tessellationShader; V.depth_clamp = f2.features.depthClamp; V.fill_lines = f2.features.fillModeNonSolid; V.depth_bias_clamp = f2.features.depthBiasClamp;
     V.multi_vp = f2.features.multiViewport; V.pstats = f2.features.pipelineStatisticsQuery; V.a2c = 1; V.mesh = x_mesh && fmesh.meshShader; V.task = V.mesh && fmesh.taskShader;
+    V.depth_clip_control = x_dcc && fdcc.depthClipControl; VLOG("TEMP depth clip control %d", V.depth_clip_control);   // TEMP diagnostic
     if (!f12.timelineSemaphore || !f13.dynamicRendering) { VRED("the device lacks timeline semaphores (%d) or dynamic rendering (%d)", f12.timelineSemaphore, f13.dynamicRendering); return 0; }
     V.bda = f12.bufferDeviceAddress; V.uab = f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingPartiallyBound && f12.runtimeDescriptorArray;
     V.placed = placed && fmp.memoryMapPlaced; V.placed_range = placed && fmp.memoryMapRangePlaced; V.unmap_reserve = placed && fmp.memoryUnmapReserve;
