@@ -448,8 +448,6 @@ static uint64_t sub_commit(uint64_t reserved) {
     VkResult r = vk.vkEndCommandBuffer(g_cb);
     g_rec_ns += now_ns() - g_sub_t0;
     g_hrec[fence % NHREC] = (typeof(g_hrec[0])){fence, g_frame, S.serial, g_stat_draws - g_sub_draws0, g_stat_ops - g_sub_ops0, g_stat_skipped - g_sub_skip0, now_ns() - g_sub_t0};
-    { static int tl = -1; static uint64_t tn; if (tl < 0) { const char *e_ = getenv("DM_TMP_FRAMEDRAWS"); tl = e_ ? atoi(e_) : 0; }   // TEMP: per submission: frame, draws, skipped, ops
-      if (tl > 0 && g_stat_draws - g_sub_draws0 >= 50 && tn++ < (uint64_t)tl) VLOG("TMPFD %llu %llu %llu %llu", (unsigned long long)(g_job_frame_set ? g_job_frame : g_frame), (unsigned long long)(g_stat_draws - g_sub_draws0), (unsigned long long)(g_stat_skipped - g_sub_skip0), (unsigned long long)(g_stat_ops - g_sub_ops0)); }
     vka_tex_gw_commit(fence);
     vka_floor_commit(tail);
     { uint64_t r_ = RP_T(); vka_up_flush(); vka_up_throttle(); RP_K(RK_C_UP, r_); }   // before the submission that may use what it made
@@ -815,15 +813,12 @@ static void not_yet(uint32_t op) {
     VRED_ONCE("DrawTexture (op %u) is not on Vulkan yet: skipped from now on", op);
 }
 int vka_mem_in_pool(uint64_t a, uint64_t n);
-static int vka_mem_in_pool_(uint64_t a, uint64_t n) { return vka_addr(a, n, NULL, NULL, NULL) || vka_mem_in_pool(a, n); }
 static int rc_known(uint64_t a, uint64_t *v) {   // the counter at a: a pending report's (rc_pend_get), else what memory holds now (0 = unknown)
     if (rc_pend_get(a, v)) return 1;   // a report recorded earlier and not written yet: the counter it will hold
     // A counter in a pool not placed yet is still in the guest's memory, where the completion thread wrote it (post): read there too. Only placed memory was read
     // before, so at a scene's start, while most of its pools were not placed yet, every condition over them read as unknown and its draws were drawn: Ocarina of
     // Time's first cutscene drew the draws its occlusion results ruled out for its first ~10 s (large holes of sky over the ground, changing each frame)
-    { static int on = -1; if (on < 0) { const char *e_ = getenv("DM_TMP_RC_POOL"); on = !e_ || atoi(e_); }
-      int vka_mem_in_pool(uint64_t a, uint64_t n);
-      if (!vka_addr(a, 8, NULL, NULL, NULL) && !(on && vka_mem_in_pool(a, 8))) return 0; }
+    if (!vka_addr(a, 8, NULL, NULL, NULL) && !vka_mem_in_pool(a, 8)) return 0;
     memcpy(v, (const void *)(uintptr_t)a, 8); return 1;
 }
 
@@ -851,7 +846,6 @@ static void exec(const uint8_t *p, int depth) {
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth < 16) exec((const uint8_t *)(uintptr_t)t, depth + 1); else VRED_ONCE("command lists nested deeper than 16"); break; }
         case OP_SIGNAL_EVENT: { uint64_t val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); post((pop){1, m, v, 0, val}); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
-            { static uint64_t tc[32], tn; tc[t & 31]++; if (!(++tn & 4095) && getenv("DM_TMP_RC")) { char b_[300]; int o_ = 0; for (int i_ = 0; i_ < 32; i_++) if (tc[i_]) o_ += snprintf(b_ + o_, sizeof b_ - o_, " type%d:%llu", i_, (unsigned long long)tc[i_]); VLOG("TEMP reports:%s", b_); } }   // TEMP (S6)
             uint32_t q = 0;
             if (g_sqp && g_cb && g_sq_n < SEGQ && (t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP)) {
                 q = (uint32_t)(g_sq_base + g_sq_n++) + 1;
@@ -867,13 +861,6 @@ static void exec(const uint8_t *p, int depth) {
         case OP_RENDER_COND: { const p_render_cond *rc = a;
             if (rc->mode >= 2) S.rc_skip = rc->mode == 3;
             else { uint64_t x, y; int known = rc_known(rc->addr, &x) && rc_known(rc->addr + 16, &y); S.rc_skip = known && (rc->mode ? x == y : x != y); }
-            { static int tr = -1; if (tr < 0) { const char *e_ = getenv("DM_TMP_RC"); tr = e_ ? atoi(e_) : 0; }   // TEMP (S6): 1 = never skip, 2 = log
-              static uint64_t nset, nskip; nset++; if (S.rc_skip) nskip++;
-              if (tr == 2 && (nset < 40 || !(nset & 1023))) VLOG("TEMP rc: mode %d addr %#llx -> skip %d (%llu of %llu skipped)", rc->mode, (unsigned long long)rc->addr, S.rc_skip, (unsigned long long)nskip, (unsigned long long)nset);
-              if (tr == 3 && rc->mode < 2) { static uint64_t nl3; uint64_t x3 = 0, y3 = 0; int k3 = rc_known(rc->addr, &x3), k4 = rc_known(rc->addr + 16, &y3); uint64_t z3[4] = {0}; if (vka_mem_in_pool_(rc->addr, 32)) memcpy(z3, (const void *)(uintptr_t)rc->addr, 32);
-                if (nl3++ < 3000) VLOG("TEMP rc3 f%llu m%d a%#llx k%d%d x%#llx y%#llx raw %#llx %#llx %#llx %#llx skip %d", (unsigned long long)g_frame, rc->mode, (unsigned long long)rc->addr, k3, k4, (unsigned long long)x3, (unsigned long long)y3, (unsigned long long)z3[0], (unsigned long long)z3[1], (unsigned long long)z3[2], (unsigned long long)z3[3], S.rc_skip); }
-              if (tr == 1 || (tr == 4 && rc->mode < 2)) S.rc_skip = 0;
-              if (tr == 5 && rc->mode < 2) S.rc_skip = 1; }
             break; }
         case OP_RESET_COUNTER: break;
         case OP_CLEAR_BUF: if (g_cb) { const p_clear_buf *cb = a; buf_fill(cb->addr, cb->size, cb->value); vka_barrier(g_cb); } break;

@@ -322,7 +322,7 @@ typedef struct {
     VkPipelineVertexInputDivisorStateCreateInfo vds; VkPipelineVertexInputStateCreateInfo vi; VkPipelineInputAssemblyStateCreateInfo ia; VkPipelineTessellationStateCreateInfo ts;
     VkPipelineViewportStateCreateInfo vp; VkPipelineRasterizationStateCreateInfo rs; VkPipelineMultisampleStateCreateInfo ms; VkPipelineDepthStencilStateCreateInfo ds;
     VkPipelineColorBlendAttachmentState cb[8]; VkPipelineColorBlendStateCreateInfo bs; VkDynamicState dyn[24]; VkPipelineDynamicStateCreateInfo dy;
-    VkPipelineViewportDepthClipControlCreateInfoEXT dcc; /* TEMP diagnostic */ VkFormat cf[8]; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci; int tess, mesh;   // mesh: a task / mesh pipeline (pstate_fill)
+    VkFormat cf[8]; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci; int tess, mesh;   // mesh: a task / mesh pipeline (pstate_fill)
     VkDescriptorSetLayout set0;   // the layout's set 0 (the library probe's independent-sets layout)
 } pstate;
 
@@ -412,8 +412,6 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
     P->ri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor, .pColorAttachmentFormats = P->cf,
                                             .depthAttachmentFormat = (VkFormat)k->dfmt, .stencilAttachmentFormat = (VkFormat)k->sfmt};
     P->tess = !mesh && (sh[3] || sh[4]); P->mesh = mesh;
-    if (mesh && k->gl_depth && V.depth_clip_control && VKA_ENV("DM_VK_MESH_SPEC", 1) >= 4) { static _Atomic int c; if (atomic_fetch_add(&c, 1) < 3) VLOG("TEMP mesh pipeline with depth clip control");   // TEMP diagnostic: the GL clip volume by the rasterizer, the module left unconverted
-        P->dcc = (VkPipelineViewportDepthClipControlCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = VK_TRUE}; P->vp.pNext = &P->dcc; }
     P->ci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &P->ri, .stageCount = P->ns, .pStages = P->ss, .pVertexInputState = mesh ? NULL : &P->vi,
         .pInputAssemblyState = mesh ? NULL : &P->ia,
         .pTessellationState = P->tess ? &P->ts : NULL, .pViewportState = &P->vp, .pRasterizationState = &P->rs, .pMultisampleState = &P->ms, .pDepthStencilState = &P->ds, .pColorBlendState = &P->bs,
@@ -456,7 +454,6 @@ static VkPipeline full_pipeline(pstate *P, vka_shader *const sh[VKA_NSTAGE], con
     VkPipeline p = VK_NULL_HANDLE;
     const vka_shader *pre0 = P->mesh ? sh[7] : sh[0];
     int bslot = build_begin("whole graphics pipeline", pre0 ? pre0->key : 0, sh[1] ? sh[1]->key : 0);
-    if (P->mesh && VKA_ENV("DM_VK_MESH_LOG", 0) >= 2) VLOG("mesh pipeline next: task %016llx mesh %016llx fragment %016llx", sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key, sh[1] ? (unsigned long long)sh[1]->key : 0ull);   // TEMP
     VkResult r = vk.vkCreateGraphicsPipelines(V.dev, g_pc, 1, &P->ci, NULL, &p);
     build_end(bslot);
     P->ci.pNext = fbi.pNext;

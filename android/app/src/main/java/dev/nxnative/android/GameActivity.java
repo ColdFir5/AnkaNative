@@ -478,6 +478,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             // Read once the game has run a while (the host finds the game's limiter after it starts); the in-game panel updates it too
             ui.postDelayed(this::noteOwnRate, 30000);
             hostRunning = true;
+            if (heldSurface != null) surface(heldSurface);   // a surface that came before the start (surface())
             if (readinessLine != null) Native.note(readinessLine + (triedAnyway ? "; the player chose Try anyway" : ""));   // the readiness check (readinessHold)
             Native.note("[nxlaunch] game: " + game + (Nup.isNup(game) ? " (.nup)" : " (folder)") + ", DM_ROMFS " + romfs + ", pack " + packDir);
             Native.note("[nxlaunch] save: " + save + " (" + saveHow + ")" + (saveNote != null ? "; " + saveNote : ""));
@@ -781,10 +782,19 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (started) Native.motionRotation(getDisplay().getRotation());
     }
 
-    @Override public void surfaceCreated(SurfaceHolder h) { Native.setSurface(h.getSurface()); }
+    // The surface reaches the host only once Native.start has set the game's environment: nxhost_set_window makes the Vulkan device (vka_init), and the switches read
+    // while it is made (DM_VK_GPL, DM_VK_MESH, a custom driver's own TU_DEBUG, the rest of vka_ctl.c's restart-only list) were otherwise read before env.txt was set,
+    // so they never took effect. A surface that comes earlier is held here and handed over right after the start (start(), after hostRunning)
+    private SurfaceHolder heldSurface;
+    private void surface(SurfaceHolder h) {
+        if (!hostRunning) { heldSurface = h; return; }
+        heldSurface = null;
+        Native.setSurface(h != null ? h.getSurface() : null);
+    }
+    @Override public void surfaceCreated(SurfaceHolder h) { surface(h); }
     // The replay letterboxes the game's 16:9 picture into the window (vka_present.c); TouchControls gives the host that rectangle (nxhost_touch_layout) with its own size
-    @Override public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) { Native.setSurface(h.getSurface()); }
-    @Override public void surfaceDestroyed(SurfaceHolder h) { Native.setSurface(null); }
+    @Override public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) { surface(h); }
+    @Override public void surfaceDestroyed(SurfaceHolder h) { surface(null); }
 
     private static boolean gamepad(int source) {
         return (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD || (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
