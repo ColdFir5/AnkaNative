@@ -737,7 +737,7 @@ void vka_gpl_line(char *out, size_t n) {
 // frame path. A key names shaders by their library key and the state bytes (vka_gkey), not driver code, so one list serves every driver and survives a shader library
 // change (a shader that is no longer in the library drops its records). Records whose shaders are missing are dropped at the next save; the list keeps at most
 // DM_VK_PREWARM_KEEP records (default 16384), and a run makes at most DM_VK_PREWARM_MAX of them (default 8192): about 1 KB of host memory each, plus the driver's pipeline
-typedef struct { uint8_t kind, bad, pad[2]; uint32_t klen; uint64_t key[5]; } pwrec;   // then klen bytes of vka_gkey, padded to 8; kind 0 graphics, 1 compute (key[0])
+typedef struct { uint8_t kind, bad, pad[2]; uint32_t klen; uint64_t key[5]; } pwrec;   // then klen bytes of vka_gkey, padded to 8; kind 0 graphics, 1 compute (key[0]), 2 mesh (mesh, fragment, task)
 typedef struct { char magic[8]; uint32_t gkey_size, n; } pwhdr;      // NXVKPW1 (read only)
 typedef struct { char magic[8]; uint32_t gkey_size, n, layout, pad; } pwhdr2;   // NXVKPW2: layout = gkey_layout(), the key's field offsets (a size that stays the same hides a reordering)
 static const char PW_MAGIC[8] = "NXVKPW1", PW_MAGIC2[8] = "NXVKPW2";
@@ -750,7 +750,7 @@ static uint32_t gkey_layout(void) {
 // A record of the file before it is used: a file from another build, a truncated or damaged one must not reach pstate_fill (an ncolor of 200 indexes past cf[8]).
 // 0 = skipped
 static int pw_rec_ok(const pwrec *r, const uint8_t *kb) {
-    if (r->kind > 1 || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
+    if (r->kind > 2 || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
     if (r->kind == 1) return r->klen == 0;
     if (r->klen < offsetof(vka_gkey, va)) return 0;
     vka_gkey k; memset(&k, 0, sizeof k); memcpy(&k, kb, r->klen);
@@ -788,10 +788,11 @@ static void pw_append(const pwrec *r, const void *kb) {   // caller holds g_pw_m
     memcpy(g_pw_buf + g_pw_len, r, sizeof *r); memset(g_pw_buf + g_pw_len + sizeof *r, 0, sz - sizeof *r); memcpy(g_pw_buf + g_pw_len + sizeof *r, kb, r->klen);
     g_pw_len += sz; g_pw_n++;
 }
-static void pw_note(int kind, vka_shader *const sh[5], const void *kb, uint32_t klen) {   // a pipeline the frame path made: into the list unless it is there
+static void pw_note(int kind, vka_shader *const sh[VKA_NSTAGE], const void *kb, uint32_t klen) {   // a pipeline the frame path made: into the list unless it is there
     if (!g_pw_path[0]) return;
     pwrec r; memset(&r, 0, sizeof r); r.kind = (uint8_t)kind; r.klen = klen;
-    for (int i = 0; i < 5; i++) r.key[i] = sh[i] ? sh[i]->key : 0;
+    if (kind == 2) { r.key[0] = sh[7] ? sh[7]->key : 0; r.key[1] = sh[1] ? sh[1]->key : 0; r.key[2] = sh[6] ? sh[6]->key : 0; }
+    else for (int i = 0; i < 5; i++) r.key[i] = sh[i] ? sh[i]->key : 0;
     uint64_t h = fnv(kb, klen, fnv(&r, sizeof r, 1469598103934665603ull));
     pthread_mutex_lock(&g_pw_mu);
     if (pw_set_add(h)) { pw_append(&r, kb); g_pw_dirty = 1; }
@@ -931,6 +932,11 @@ static void *pw_main(void *a) {
         vka_shader *sh[VKA_NSTAGE]; memset(sh, 0, sizeof sh); int bad = !pw_rec_ok(&r, kb);
         if (bad) {}
         else if (r.kind == 1) { if (!(sh[5] = vka_shader_by_key(r.key[0]))) bad = 1; }
+        else if (r.kind == 2) {
+            if (!(sh[7] = vka_shader_by_key(r.key[0]))) bad = 1;
+            if (r.key[1] && !(sh[1] = vka_shader_by_key(r.key[1]))) bad = 1;
+            if (r.key[2] && !(sh[6] = vka_shader_by_key(r.key[2]))) bad = 1;
+        }
         else for (int s = 0; s < 5; s++) if (r.key[s] && !(sh[s] = vka_shader_by_key(r.key[s]))) bad = 1;
         vka_layout lay;
         if (!bad && !vka_layout_of(sh, r.kind == 1, &lay)) bad = 1;
@@ -940,7 +946,7 @@ static void *pw_main(void *a) {
         else if (r.kind == 1) { cs_obtain(sh[5], &lay, 1, &made); }
         else {
             vka_gkey k; memset(&k, 0, sizeof k); memcpy(&k, kb, r.klen < sizeof k ? r.klen : sizeof k);
-            if (k.vin_static != (uint32_t)!V.vin_dyn) { atomic_fetch_add(&g_pw_bad, 1); }   // a list from a device with the other vertex input (not this one's keys)
+            if (r.kind == 0 && k.vin_static != (uint32_t)!V.vin_dyn) { atomic_fetch_add(&g_pw_bad, 1); }   // a list from a device with the other vertex input (not this one's keys)
             else {
                 gkey_full fk; memset(&fk, 0, sizeof fk); memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay.layout; fk.k = k;
                 size_t len = k.vin_static ? sizeof fk : offsetof(gkey_full, k.va);
@@ -1142,8 +1148,11 @@ static void gfx_build(gval *g, size_t len, vka_shader *const sh[VKA_NSTAGE], con
         if (!p && !linked) p = full_pipeline(P, sh, prewarm ? " (prewarm)" : async ? " in the background (asynchronous)" : NULL);
     }
     free(P);
-    // (mesh pipelines stay out of the prewarm list: its records name the five vertex pipeline stages only; open)
-    if (!prewarm && !sh[7]) { pw_note(0, sh, k, (uint32_t)(len - offsetof(gkey_full, k))); pw_explain(sh, k, (uint32_t)(len - offsetof(gkey_full, k)), (now_ns() - t_make) / 1e6, linked, async ? " in the background" : " on the frame path"); }
+    if (!prewarm) {
+        uint32_t klen = (uint32_t)(len - offsetof(gkey_full, k));
+        pw_note(sh[7] ? 2 : 0, sh, k, klen);
+        if (!sh[7]) pw_explain(sh, k, klen, (now_ns() - t_make) / 1e6, linked, async ? " in the background" : " on the frame path");
+    }
     pthread_mutex_lock(&g_mu);
     __atomic_store_n(&g->linked, (uint8_t)linked, __ATOMIC_RELEASE); __atomic_store_n(&g->p, p, __ATOMIC_RELEASE); __atomic_store_n(&g->busy, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_busy_cv);
@@ -1217,7 +1226,7 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
     pthread_mutex_unlock(&g_mu);
     if (r && !over) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("compute pipeline %016llx: %d; its dispatches are skipped", (unsigned long long)cs->key, r); }
     { double ms_ = (now_ns() - t0) / 1e6; static _Atomic int n; if (!r && ms_ > 50 && atomic_fetch_add(&n, 1) < 200) VLOG("compute pipeline %016llx took %.0f ms%s", (unsigned long long)cs->key, ms_, prewarm ? " (prewarm)" : ""); }
-    if (!prewarm && !over) { vka_shader *s5[5] = {cs, NULL, NULL, NULL, NULL}; pw_note(1, s5, "", 0); }   // (one not made stays out of the prewarm list)
+    if (!prewarm && !over) { vka_shader *s[VKA_NSTAGE] = {cs}; pw_note(1, s, "", 0); }   // (one not made stays out of the prewarm list)
     *made = 1;
     return p;
 }

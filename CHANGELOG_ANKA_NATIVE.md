@@ -5,6 +5,16 @@ Changes in Anka Native, grouped by topic. Most of the new behaviour is behind `D
 ([dm/games/0400486024DEC000/game.tsv](dm/games/0400486024DEC000/game.tsv)), so other games keep their old behaviour unless a switch is set.
 The credits for the code it is built on are in [NOTICE.md](NOTICE.md).
 
+## Unreleased
+
+- **Compute shaders read guest memory through the page index** (library `v-4a5fdaea7723`). Their raw global memory searches were loops (`gmem_loop`, a 12-step
+  binary search per load); they now take the page index the other stages use since `v-fc7819d73925` (`vk_android_spv.py` `GMEM_LOOP_STAGES` is empty). Ocarina of
+  Time on the Galaxy S26 Ultra (Turnip, GPU at 1300 MHz, Deku Tree cutscene): the compute shader `9e6b00b050e30801` went from 6.4 to 0.85 ms a frame and the GPU
+  frame from 35.4 to 30.9 ms; the picture is unchanged. The profile's delta manifest is for the new version: a phone with `v-0dd4341ae6ce` translates 811 shaders.
+- **Mesh pipelines are in the prewarm list** (`vka_pso.c`, record kind 2: mesh, fragment and task shader). They were left out, so a run without them in the
+  pipeline cache (the first after a driver or library change) made each one on the frame path, about 300 ms each: Ocarina of Time's first scene change made 43 in
+  one 14.8-20.5 s frame. The second such run makes them on the prewarm threads (46 of 46) and the longest frame is the scene's texture load, 2.0 s.
+
 ## Anka Native 0.2.2
 
 - **The launcher no longer takes adb control commands from other apps** ([#7](https://github.com/EddizEge/AnkaNative/issues/7)). Its activity is

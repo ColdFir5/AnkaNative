@@ -1283,8 +1283,9 @@ def gmem_loop(m, map_var):
     return done
 
 
-GMEM_LOOP_STAGES = frozenset({'cs'})   # where gmem_loop applies: compute. In Ocarina of Time's 683x384 opaque pass its vertex shaders' loops (802 vs, 605 ps changed in
-# v-4eb4a4fafd13) came with a pass 8x slower on the phone (33-48 ms → ~370 ms), while compute gained (9e6b00b0: 20 → 9.1 ms); android/SHADERS.md#build-speed
+GMEM_LOOP_STAGES = frozenset()   # where gmem_loop applies: nowhere; every stage reads the page index (gmem_pidx). Loops in Ocarina of Time's vertex shaders
+# (v-4eb4a4fafd13) made its 683x384 opaque pass 8x slower on the phone (33-48 ms → ~370 ms); in compute the index beats the loops too (9e6b00b0: 6.4 → 0.85 ms
+# a frame on Turnip at 1300 MHz, GPU frame 35.4 → 30.9 ms; android/SHADERS.md#build-speed)
 GMEM_CACHE_WORDS = 6   # the words of an entry gmem_cache keeps: start, end, delta (low, high each; dmsh_abi.h DMSH_GMEM_MAP_ENTRY). On the A830 (offline ir3,
 # b1f06157308e3b22) 6 runs the fewest instructions, spills and loads where the cache hits; 0 (the index only) the fewest in all (gmc/IMPL.md)
 GMEM_CACHE = False   # the other stages' searches behind the invocation's cached entry (gmem_cache); False: left unrolled, as in v-a25cc83eed63. Off: with it on
