@@ -1593,7 +1593,9 @@ def _result_id(x):   # the id an instruction defines (types and constants do not
     return x[2] if len(x) > 2 else None
 
 
-GMEM_COALESCE = True   # coalesce gmem_pidx helper calls sharing one base address within a basic block
+GMEM_COALESCE = False   # coalesce gmem_pidx helper calls sharing one base address within a basic block. Off: on the S26 (Turnip, which inlines every
+# helper call) the per-word fallback it keeps raised register use for no measured gain. Ocarina of Time's forest at 1300 MHz, same scene, 50% foliage: GPU frame
+# median 30.5 ms on vs 30.3 off; on, mesh eb021183 48 registers / 4 waves (off 42 / 6), 73dc0b90 spills 629 / 839 (off 71 / 97), compute 9e6b00b0 6 waves (off 10).
 SC_PHYSICAL_STORAGE_BUFFER = 5349
 OP_ULESS_THAN_EQUAL = 178
 
