@@ -473,6 +473,33 @@ static void prefault(uintptr_t lo, uintptr_t hi) {
     g_pf_ns += mono_ns() - t0; g_pf_bytes += hi - lo; g_pf_nlog++;
 }
 
+typedef struct { uintptr_t end; unsigned long long off; char path[64]; } mapline;
+static int maps_at(uintptr_t a, mapline *o) {
+    FILE *f = fopen("/proc/self/maps", "r"); if (!f) return 0;
+    char ln[512]; int found = 0;
+    while (!found && fgets(ln, sizeof ln, f)) {
+        unsigned long lo, hi; unsigned long long off; char path[256]; path[0] = 0;
+        if (sscanf(ln, "%lx-%lx %*4s %llx %*s %*s %255s", &lo, &hi, &off, path) < 3 || lo != a) continue;
+        o->end = hi; o->off = off; snprintf(o->path, sizeof o->path, "%s", path); found = 1;
+    }
+    fclose(f); return found;
+}
+static _Atomic uint64_t g_stale_n, g_stale_bytes;
+static int stale_on(void) { static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_STALE_MAP", 1) != 0; return on; }
+// Whether the driver keeps its first map after vkUnmapMemory (read in place, after the copy's unmap): only such a driver leaves the map stale_map_drop takes, and only
+// then is the address never free between the unmap and the free. A driver that unmaps there (Turnip) frees the address, its next buffer can be mapped there (a command
+// stream's, same size and file), and an unmap after the free would take that buffer down under the encoder (SEGV in vk-enc, 2026-11-17). 0 = not seen yet, n > 0 = kept
+// n times, -1 = unmapped once: stale_map_drop is off for the process. Read until FIRST_MAP_SURE kept placements with no unmap seen
+#define FIRST_MAP_SURE 8
+static _Atomic int g_first_map;
+static void first_map_seen(seg_t *s) {
+    int k = atomic_load(&g_first_map); if (k < 0 || k >= FIRST_MAP_SURE || !stale_on()) { if (k < 0) s->map0 = 0; return; }
+    mapline m;
+    if (maps_at(s->map0, &m) && m.end - s->map0 == s->map0_n && strstr(m.path, "kgsl")) { atomic_fetch_add(&g_first_map, 1); return; }
+    s->map0 = 0;
+    if (atomic_exchange(&g_first_map, -1) >= 0) VLOG("the driver takes its first map of a memory down at vkUnmapMemory: no first map is left at a free, DM_VK_STALE_MAP has nothing to do");
+}
+
 // Place [lo, hi) (no segment overlaps it; caller holds g_pl, and g_rw for writing only under DM_VK_MEM_LOCK_WHOLE). 1 = placed, 0 = failed with the range as it was; *grow = the size the driver wants when it is larger than the range
 // Where a placement's time goes (logged every 256 placements): buffer and allocation, the protections read, the copy, the maps, the prefault, the protections put back
 static uint64_t g_ph[6], g_ph_n;
@@ -505,6 +532,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow, span_t *sp) {
         copy_readable(p, lo, pr, npr);
         p3 = mono_ns(); g_ph[2] += p3 - p2; p2 = p3;
         vk.vkUnmapMemory(V.dev, s.mem);
+        first_map_seen(&s);
         VkMemoryMapPlacedInfoEXT pi = {VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = (void *)lo};
         VkMemoryMapInfoKHR mi = {VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pi, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT, .memory = s.mem, .offset = 0, .size = V.placed_range ? n : VK_WHOLE_SIZE};
         void *q = NULL;
@@ -600,21 +628,8 @@ static void detach(int i, segvec *v) {   // caller holds g_pl, and g_rw for writ
 // Before the free, maps_at reads the placed map's line of /proc/self/maps (its file and offset: the kernel object); after it, a mapping that still starts at map0 with
 // the same file, the same offset and the memory's size is that first map and nothing else (the address was never free in between), and is unmapped here.
 // DM_VK_STALE_MAP=0 (read once; default 1): leave it (the leak as before, to measure it)
-typedef struct { uintptr_t end; unsigned long long off; char path[64]; } mapline;
-static int maps_at(uintptr_t a, mapline *o) {
-    FILE *f = fopen("/proc/self/maps", "r"); if (!f) return 0;
-    char ln[512]; int found = 0;
-    while (!found && fgets(ln, sizeof ln, f)) {
-        unsigned long lo, hi; unsigned long long off; char path[256]; path[0] = 0;
-        if (sscanf(ln, "%lx-%lx %*4s %llx %*s %*s %255s", &lo, &hi, &off, path) < 3 || lo != a) continue;
-        o->end = hi; o->off = off; snprintf(o->path, sizeof o->path, "%s", path); found = 1;
-    }
-    fclose(f); return found;
-}
-static _Atomic uint64_t g_stale_n, g_stale_bytes;
-static int stale_on(void) { static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_STALE_MAP", 1) != 0; return on; }
 static void stale_map_drop(const seg_t *s, const mapline *placed) {
-    if (!s->map0 || !s->map0_n || !placed->path[0] || s->map0 == s->lo) return;
+    if (!s->map0 || !s->map0_n || !placed->path[0] || s->map0 == s->lo || atomic_load(&g_first_map) < 0) return;
     mapline m; if (!maps_at(s->map0, &m) || strcmp(m.path, placed->path) || m.off != placed->off || !strstr(m.path, "kgsl")) return;
     // The first map may be in pieces (a neighbour merged or a protection split it): only the whole memory in one mapping from map0 is taken
     if (m.end - s->map0 != s->map0_n || munmap((void *)s->map0, s->map0_n)) return;

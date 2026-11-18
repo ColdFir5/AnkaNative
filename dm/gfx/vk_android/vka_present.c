@@ -539,7 +539,7 @@ static int present_one(const pq_item *it) {
                           fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     } else if (im && !blit) VRED_ONCE("window texture serial %llu (format %#x) cannot be blitted to the swapchain: presented black", (unsigned long long)im->serial, im->d.format);
     if (blit >= 0) vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    if (!it->src) vka_ctl_shot_record(cb, im, cx, cy, cw, ch);   // the game's own frames only
+    if (!it->src) vka_ctl_shot_record(cb, im, cx, cy, cw, ch, it->ticket, it->t.serial);   // the game's own frames only
     vk.vkEndCommandBuffer(cb);
     VkSemaphore ws[2] = {g_fr[k].acq, V.tl}; uint64_t wv[2] = {0, it->fence}; VkPipelineStageFlags st[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};   // the image's first barrier is ALL_COMMANDS
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 2, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};
@@ -566,9 +566,15 @@ static int present_one(const pq_item *it) {
     { static int mode = -1, at; if (mode < 0) { const char *e = getenv("DM_VK_TEST_HANG"); mode = 0; if (e && sscanf(e, "%d,%d", &mode, &at) < 1) mode = 0; if (at <= 0) at = 600; }
       if (mode && it->ticket == (uint64_t)at && it->fence) { wv[1] = mode == 1 ? vka_fence_last() + 1 : V.tl_queued + 1000000000ull;
           VRED("DM_VK_TEST_HANG=%d: present ticket %llu waits for fence %llu (%llu handed to the queue)", mode, (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); } }
+    struct timespec tp0, tp1, tp2; clock_gettime(CLOCK_MONOTONIC, &tp0);   // TEMP probe: present copy submit vs vkQueuePresentKHR under the queue lock
     r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, g_fr[k].fence);
+    clock_gettime(CLOCK_MONOTONIC, &tp1);
     VkResult pr = r ? r : vk.vkQueuePresentKHR(V.q, &pi);
+    clock_gettime(CLOCK_MONOTONIC, &tp2);
     pthread_mutex_unlock(&V.qmu);
+    { static double sb, pq, pqm; static int n; double a = (tp1.tv_sec - tp0.tv_sec) * 1e3 + (tp1.tv_nsec - tp0.tv_nsec) / 1e6, b = (tp2.tv_sec - tp1.tv_sec) * 1e3 + (tp2.tv_nsec - tp1.tv_nsec) / 1e6;
+      sb += a; pq += b; if (b > pqm) pqm = b;
+      if (++n == 60) { VLOG("TEMP probe present: 60 presents, copy submit %.1f ms, vkQueuePresentKHR %.1f ms (max %.1f)", sb, pq, pqm); sb = pq = pqm = 0; n = 0; } }
     g_fr[k].held = im;
     if (!r) vka_ctl_shot_done(g_fr[k].fence);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("present submission %d", r); return 0; }

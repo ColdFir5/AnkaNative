@@ -365,6 +365,8 @@ for ln in open(MAP):
 PAIRS = NS['load_pairs'](GAME, dm_dir)
 _dw = GAME.table('dual_want.tsv')   # pixel shaders a pipeline blends with output 1 as the second source (dmsh_build.py DUAL_WANT, from the Mac host's DM_NVN_DUAL_WANT)
 DUAL_WANT = {l.split()[0] for l in open(_dw) if l.strip() and not l.lstrip().startswith('#')} if _dw.exists() else set()
+CB_SCALE, CB_SCALE_STR = spv.parse_cb_scale(os.environ.get('DMSH_VK_CB_SCALE', ''))
+OOT_FADE3 = os.environ.get('DMSH_VK_OOT_FADE3', '') == '1'
 VS_OF = collections.defaultdict(set)
 for _v, _ps in PAIRS.items():
     for _p in _ps: VS_OF[_p].add(_v)
@@ -611,6 +613,16 @@ def finish(key, w, job, c1):
     if stage == 'ms':   # the translator adds the constant itself (job gl_depth_spec: a mesh program may not read its outputs back)
         gl = any(d.get(spv.DEC_SPEC_ID) == [VK['SPEC_GL_DEPTH']] for d in m.decos.values())
     alpha = stage == 'ps' and spv.alpha_test(m, VK['SPEC_ALPHA_FUNC'])
+    if OOT_FADE3 and key == 'e855420a39e60874':
+        if spv.oot_fade3(m):
+            print(f'oot_fade3: {key}: applied Block 3 screen-size fade', flush=True)
+        else:
+            print(f'oot_fade3: {key}: pattern not found, module unchanged', flush=True)
+    if key in CB_SCALE:
+        n_scaled = spv.cb_scale(m, CB_SCALE[key])
+        if n_scaled:
+            facs = ', '.join(str(f) for f in dict.fromkeys(r[3] for r in CB_SCALE[key]))
+            print(f'cb_scale: {key}: scaled {n_scaled} load{"s" if n_scaled != 1 else ""} by {facs}', flush=True)
     mods = [(VK['MOD_BASE'], m.data())]
     uint_mask = 0
     iout = spv.int_outputs(m) if stage == 'ps' else set()   # (once: ps_variants and facts_of read the same module)
@@ -840,7 +852,8 @@ def result_head(path):
             if len(d) != 12 or d[:8] != RESULT_MAGIC: return None
             h = json.loads(f.read(struct.unpack('<I', d[8:])[0]))
     except (OSError, ValueError): return None
-    return h if (h.get('vk'), h.get('inputs'), h.get('raw'), h.get('val'), h.get('key')) == (TOOLS, INPUTS, RAW, VAL_ID, os.path.basename(path)[:-2]) else None
+    k = os.path.basename(path)[:-2]
+    return h if (h.get('vk'), h.get('inputs'), h.get('raw'), h.get('val'), h.get('key'), h.get('cb_scale'), h.get('oot_fade3')) == (TOOLS, INPUTS, RAW, VAL_ID, k, CB_SCALE_STR.get(k), '1' if OOT_FADE3 and k == 'e855420a39e60874' else None) else None
 
 
 def write_result(key, st, err, r, ps_in):
@@ -848,6 +861,8 @@ def write_result(key, st, err, r, ps_in):
     from an older library (delta) has 'reused': that library's version in its head and its reflection"""
     refl, modules = r if r else (None, [])
     h = {'vk': TOOLS, 'inputs': INPUTS, 'raw': RAW, 'val': VAL_ID, 'key': key, 'stage': STAGE_OF[key], 'st': st, 'err': err, 'ps_inputs': sorted(ps_in) if ps_in is not None else None,
+         **({'cb_scale': CB_SCALE_STR[key]} if key in CB_SCALE_STR else {}),
+         **({'oot_fade3': '1'} if OOT_FADE3 and key == 'e855420a39e60874' else {}),
          'refl': refl, 'modules': [[variant, size, len(stored), codec] for variant, size, stored, codec, _ in modules]}
     if refl and refl.get('reused'): h['reused'] = refl['reused']
     j = json.dumps(h, separators=(',', ':')).encode()
@@ -930,7 +945,7 @@ heads = {k: h for k in keys if (h := result_head(result_path(k)))}
 MANIFEST, _why = (None, 'a key list') if want else (None, 'DMSH_VK_RAW') if RAW else load_manifest()
 REUSED = {k for k, h in heads.items() if h.get('reused')}
 if MANIFEST:
-    _cand = [k for k in keys if k not in heads and MANIFEST['hashes'].get(k, '-') != '-']
+    _cand = [k for k in keys if k not in heads and k not in CB_SCALE and not (OOT_FADE3 and k == 'e855420a39e60874') and MANIFEST['hashes'].get(k, '-') != '-']
     _libs = older_libraries() if _cand else []
     _have = collections.defaultdict(list)   # key → [(library, entry number)], newest library first
     for L in _libs:

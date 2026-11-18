@@ -284,11 +284,13 @@ static int cmp_img(const void *a, const void *b) {
 }
 static int cmp_opq(const void *a, const void *b) { const popq *p = a, *q = b; CMPK((uintptr_t)p->s, (uintptr_t)q->s); CMPK(p->seq, q->seq); return 0; }
 static int cmp_buf(const void *a, const void *b) { const pbuf *p = a, *q = b; CMPK((uintptr_t)p->buf, (uintptr_t)q->buf); CMPK(p->seq, q->seq); return 0; }
+int vks_tmp_batches, vks_tmp_binds;   // TEMP probe
 void vks_queue_locked(uint32_t *nw, VkSemaphore *ws, uint64_t *wv, VkPipelineStageFlags *wst) {
     pthread_mutex_lock(&g_ks);
     if (!g_stl) { pthread_mutex_unlock(&g_ks); return; }   // no sparse image yet
     if (vka_hung()) { g_npi = g_npo = g_npb = g_nrel = 0; pthread_mutex_unlock(&g_ks); return; }   // nothing runs any more: the binds dropped (their slots are not reused either)
     if (g_npi || g_npo || g_npb) {
+        vks_tmp_batches++; vks_tmp_binds += (int)(g_npi + g_npo + g_npb);   // TEMP probe
         qsort(g_pi, g_npi, sizeof *g_pi, cmp_img); qsort(g_po, g_npo, sizeof *g_po, cmp_opq); qsort(g_pb, g_npb, sizeof *g_pb, cmp_buf);
         { uint32_t j = 0; for (uint32_t i = 0; i < g_npi; i++) {
               const pimg *p = &g_pi[i], *q = i + 1 < g_npi ? &g_pi[i + 1] : NULL;

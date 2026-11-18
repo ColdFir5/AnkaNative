@@ -66,7 +66,7 @@ static const char *const g_restart[] = {"DM_VK_VALIDATE", "DM_VK_DRIVER", "DM_VK
                                         "DM_VK_WORKER_FRAMES", "DM_VK_TEST_HANG", "DM_LSFG_DLL", "DM_FPS", "NXHOST_VK_SELFTEST", "DM_CTL", "DM_VK_PREWARM", "DM_VK_PREWARM_MAX", "DM_VK_PREWARM_FILE", "DM_VK_LC_GLOBAL",
                                         "DM_VK_PSO_ASYNC", NULL};
 // Switches the replay reads again after a change (VKA_ENV, or at use); a table, so the log line can say which kind a key is
-static const char *const g_live[] = {"DM_VK_DRAW", "DM_VK_STATS", "DM_VK_HANG_S", "DM_VK_HANG_EXIT", "DM_VK_FRAME_RATE", "DM_VK_FRAME_RATE_HOLD", "DM_VK_PCACHE_SAVE_S", "DM_VK_PCACHE_SAVE_MS", "DM_VK_GPL_GIVEUP", "DM_VK_GPL_PROBE", "DM_VK_PREWARM_KEEP", "DM_VK_PRETRANSFORM", "DM_VK_FSR", "DM_VK_FSR_SHARP", "DM_VK_TEX_TRACK",
+static const char *const g_live[] = {"DM_VK_DRAW", "DM_VK_STATS", "DM_VK_HANG_S", "DM_VK_HANG_EXIT", "DM_VK_FRAME_RATE", "DM_VK_FRAME_RATE_HOLD", "DM_VK_PCACHE_SAVE_S", "DM_VK_PCACHE_SAVE_MS", "DM_VK_GPL_GIVEUP", "DM_VK_GPL_PROBE", "DM_VK_PREWARM_KEEP", "DM_VK_PRETRANSFORM", "DM_VK_FSR", "DM_VK_FSR_SHARP", "DM_VK_TEX_TRACK", "DM_VK_MESH_INDIRECT_DIAG",
                                      "DM_VK_CHUNK", "DM_VK_PASS_CLEARS", "DM_VK_PASS_KEEP", "DM_VK_DYN_FILTER", "DM_VK_PROF", "DM_VK_RPROF", "DM_VK_ROWS", "DM_VK_SYNCLOG", "DM_VK_UBWC", "DM_VK_IMG_UPGRADE", "DM_VK_DONE_LAST", "DM_VK_AFF_REPLAY", "DM_VK_AFF_ALL",
                                      "DM_VK_NANSCAN_DUMP", "DM_VK_VB_FILTER", "DM_VK_ENC_BATCH", "DM_VK_BAR_KEEP", "DM_VK_DRV_MEMO", "DM_VK_PUSH_DELTA", "DM_VK_UPLOAD_MT", "DM_VK_UPLOAD_MT_MIN",
                                      "DM_LSFG", "DM_LSFG_MULT", "DM_LSFG_TARGET", "DM_LSFG_FLOW", NULL};
@@ -87,7 +87,7 @@ void dm_gfx_ctl_env(const char *key, const char *val) {   // the control thread
 }
 static int lsfg_int(const char *k, int def) { char b[64]; return str_get(k, b, sizeof b) ? atoi(b) : def; }
 static void apply(void) {
-    int lsfg = 0, pre = 0; char done[1024]; size_t dn = 0; done[0] = 0;
+    int lsfg = 0, pre = 0, mesh_indirect_diag_changed = 0; char done[1024]; size_t dn = 0; done[0] = 0;
     pthread_mutex_lock(&g_emu);
     static typeof(g_pend[0]) p[NOVR];   // apply runs under the submit lock: one caller at a time
     int n = g_npend; memcpy(p, g_pend, (size_t)n * sizeof p[0]); g_npend = 0;
@@ -97,6 +97,7 @@ static void apply(void) {
         snprintf(g_ovr[j].key, sizeof g_ovr[j].key, "%s", p[i].key); snprintf(g_ovr[j].val, sizeof g_ovr[j].val, "%s", p[i].val); g_ovr[j].set = p[i].val[0] != 0; g_ovr[j].seq++;
         if (p[i].val[0]) setenv(p[i].key, p[i].val, 1); else unsetenv(p[i].key);
         lsfg |= !strncmp(p[i].key, "DM_LSFG", 7) && strcmp(p[i].key, "DM_LSFG_DLL"); pre |= !strcmp(p[i].key, "DM_VK_PRETRANSFORM");
+        mesh_indirect_diag_changed |= !strcmp(p[i].key, "DM_VK_MESH_INDIRECT_DIAG");
         const char *kind = in(g_restart, p[i].key) ? "restart only: takes effect at the next start" : in(g_live, p[i].key) ? "live"
                          : !strncmp(p[i].key, "DM_VK_", 6) ? "not in the live table: live where its reader uses VKA_ENV" : "set in the environment (live where the host reads it at use)";
         VLOG("ctl: env %s=%s applied at frame %llu (%s)", p[i].key, p[i].val, (unsigned long long)vka_frame(), kind);
@@ -104,6 +105,7 @@ static void apply(void) {
     }
     pthread_mutex_unlock(&g_emu);
     atomic_fetch_add(&vka_env_gen, 1);
+    if (mesh_indirect_diag_changed) vka_draw_mesh_indirect_diag_control(VKA_ENV("DM_VK_MESH_INDIRECT_DIAG", 0));
     (void)pre;   // the present reads DM_VK_PRETRANSFORM through VKA_ENV and makes a new swapchain when it changed (vka_present.c)
     if (lsfg) nxhost_framegen_set(lsfg_int("DM_LSFG", 0) != 0, lsfg_int("DM_LSFG_MULT", 2), lsfg_int("DM_LSFG_TARGET", 0), lsfg_int("DM_LSFG_FLOW", 75));
 }
@@ -172,8 +174,9 @@ void vka_ctl_frame(uint64_t f) {   // mtl_set_frame: frame f begins
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
 static char g_shot_path[1024]; static _Atomic int g_shot_want;
 static _Atomic uint64_t g_shot_serial;   // texshot: the texture of this serial instead of the window texture (0: the window)
+static _Atomic uint64_t g_shot_capture_seq;
 static VkBuffer g_sbuf; static VkDeviceMemory g_smem; static void *g_smap; static VkDeviceSize g_ssize;
-static struct { int on, w, h, fmt, flip, alpha; uint64_t frame; } g_rec_shot;
+static struct { int on, w, h, fmt, flip, alpha, trace; uint64_t frame, capture_seq, present_ticket, capture_mono_ns, source_serial, image_serial; } g_rec_shot;
 static char g_ctl_dir[1024];
 static void ctl_dir(void) {
     if (g_ctl_dir[0]) return;
@@ -207,7 +210,7 @@ static int shot_bpp(VkFormat f) {
     default: return 0;
     }
 }
-void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch) {   // present thread, before vkEndCommandBuffer
+void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch, uint64_t ticket, uint64_t present_serial) {   // present thread, before vkEndCommandBuffer
     g_rec_shot.on = 0;
     if (!atomic_load_explicit(&g_shot_want, memory_order_relaxed)) return;
     uint64_t ser = atomic_exchange(&g_shot_serial, 0);
@@ -227,8 +230,14 @@ void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
     vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     g_rec_shot.on = 1; g_rec_shot.w = cw; g_rec_shot.h = ch; g_rec_shot.fmt = im->f.vk; g_rec_shot.alpha = bpp == 4 && im->f.vk != VK_FORMAT_A2B10G10R10_UNORM_PACK32 && im->f.vk != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && VKA_ENV("DM_VK_SHOT_ALPHA", 0); g_rec_shot.flip = vka_origin_ll(); g_rec_shot.frame = vka_frame();
+    char trace_value[32]; g_rec_shot.trace = vka_env_str("DM_VK_SHOT_TRACE", trace_value, sizeof trace_value) && atoi(trace_value) != 0;
+    g_rec_shot.capture_seq = g_rec_shot.trace ? atomic_fetch_add_explicit(&g_shot_capture_seq, 1, memory_order_relaxed) + 1 : 0;
+    g_rec_shot.present_ticket = g_rec_shot.trace ? ticket : 0;
+    g_rec_shot.capture_mono_ns = g_rec_shot.trace ? now_ns() : 0;
+    g_rec_shot.source_serial = g_rec_shot.trace ? (ser ? ser : present_serial) : 0;
+    g_rec_shot.image_serial = g_rec_shot.trace ? im->serial : 0;
 }
-typedef struct { uint8_t *rgb; int w, h; char path[1100]; uint64_t frame; } shot_job;
+typedef struct { uint8_t *rgb; int w, h, trace; char path[1100]; uint64_t frame, capture_seq, present_ticket, capture_mono_ns, source_serial, image_serial; } shot_job;
 static void put32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 static void chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {
     uint8_t h[8]; put32(h, n); memcpy(h + 4, type, 4); fwrite(h, 1, 8, f); if (n) fwrite(d, 1, n, f);
@@ -246,7 +255,11 @@ static void *shot_main(void *arg) {
             chunk(f, "IHDR", ih, 13); chunk(f, "IDAT", z, (uint32_t)zn); chunk(f, "IEND", NULL, 0);
             fclose(f); chmod(j->path, 0644);
             VLOG("ctl: screenshot of frame %llu, %dx%d → %s", (unsigned long long)j->frame, j->w, j->h, j->path);
-        } else VLOG("ctl: screenshot: cannot write %s", j->path);
+            if (j->trace) VLOG("ctl: TEMP screenshot capture_seq=%llu present_ticket=%llu capture_mono_ns=%llu source_texture_serial=%llu image_serial=%llu %dx%d → %s", (unsigned long long)j->capture_seq, (unsigned long long)j->present_ticket, (unsigned long long)j->capture_mono_ns, (unsigned long long)j->source_serial, (unsigned long long)j->image_serial, j->w, j->h, j->path);
+        } else {
+            VLOG("ctl: screenshot: cannot write %s", j->path);
+            if (j->trace) VLOG("ctl: TEMP screenshot capture_seq=%llu present_ticket=%llu capture_mono_ns=%llu source_texture_serial=%llu image_serial=%llu write failed → %s", (unsigned long long)j->capture_seq, (unsigned long long)j->present_ticket, (unsigned long long)j->capture_mono_ns, (unsigned long long)j->source_serial, (unsigned long long)j->image_serial, j->path);
+        }
     }
     free(flt); free(z); free(j->rgb); free(j); return NULL;
 }
@@ -281,7 +294,8 @@ void vka_ctl_shot_done(VkFence fence) {   // present thread, after the present's
             }
         }
     }
-    j->rgb = rgb; j->w = w; j->h = h; j->frame = g_rec_shot.frame;
+    j->rgb = rgb; j->w = w; j->h = h; j->frame = g_rec_shot.frame; j->trace = g_rec_shot.trace; j->capture_seq = g_rec_shot.capture_seq;
+    j->present_ticket = g_rec_shot.present_ticket; j->capture_mono_ns = g_rec_shot.capture_mono_ns; j->source_serial = g_rec_shot.source_serial; j->image_serial = g_rec_shot.image_serial;
     pthread_mutex_lock(&g_smu);
     if (g_shot_path[0]) snprintf(j->path, sizeof j->path, "%s", g_shot_path);
     else { ctl_dir(); snprintf(j->path, sizeof j->path, "%s/ctl-shot-%llu.png", g_ctl_dir, (unsigned long long)j->frame); }

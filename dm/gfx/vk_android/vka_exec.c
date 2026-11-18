@@ -24,6 +24,7 @@ static unsigned g_slot_i;
 static int g_chunk_draws = -1, g_nx; static uint64_t g_chunk_d0;   // chunk(): draws a part, parts this submission, draws at its part's start
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cb;   // the submission being recorded (NULL without a device)
+static _Atomic int g_mesh_gpu_probe_part_failed;
 VkCommandBuffer vka_rp_cb(void) { return g_cb; }
 typedef struct { int kind; uint32_t mode, v, type; uint64_t addr; } pop;   // kind 1 event, 2 counter report
 static pop *g_post; static int g_npost, g_postcap;
@@ -90,11 +91,51 @@ extern uint64_t vka_n_rp, vka_n_bar; static uint64_t g_n_ub, g_n_sub, g_rec_ns, 
 static _Atomic uint64_t g_slotw_ns;
 uint64_t vka_exec_slot_wait_ns(void) { return atomic_load_explicit(&g_slotw_ns, memory_order_relaxed); }
 static _Atomic uint64_t g_fstart[64], g_fstart_f[64];   // when the replay began recording each frame's first submission (its number mod 64): the adaptive floor's spans
-static uint64_t g_job_frame; static int g_job_frame_set;   // the frame of the submission the worker replays (vka_exec_sub_frame)
+static _Thread_local uint64_t g_job_frame; static _Thread_local int g_job_frame_set;   // the frame of the submission the worker replays (vka_exec_sub_frame)
+static _Atomic int g_rc_diag_on = -1;
+static pthread_mutex_t g_rc_diag_mu = PTHREAD_MUTEX_INITIALIZER;
+enum { RC_DIAG_WINDOWS = 3600, RC_DIAG_FRAMES = 5 };
+static struct {
+    uint64_t start, frame, conditions, cond_skip, unknown, enable, disable;
+    uint64_t draws, skipped, no_cb, skipped_frame, frames_skipped, max_skipped;
+    unsigned windows;
+    int active;
+} g_rc_diag;
+static void rc_diag_finish_frame(void) {
+    if (g_rc_diag.skipped_frame) {
+        g_rc_diag.frames_skipped++;
+        if (g_rc_diag.skipped_frame > g_rc_diag.max_skipped) g_rc_diag.max_skipped = g_rc_diag.skipped_frame;
+    }
+    g_rc_diag.skipped_frame = 0;
+}
+static void rc_diag_flush(void) {
+    if (!g_rc_diag.active || g_rc_diag.windows >= RC_DIAG_WINDOWS) return;
+    rc_diag_finish_frame();
+    VLOG("TEMP render condition frames %llu-%llu: conditional %llu skipped %llu unknown %llu; explicit enable %llu disable %llu; draws passed to replay %llu render-disabled %llu no command buffer %llu; frames with skips %llu max skips/frame %llu",
+         (unsigned long long)g_rc_diag.start, (unsigned long long)g_rc_diag.frame, (unsigned long long)g_rc_diag.conditions,
+         (unsigned long long)g_rc_diag.cond_skip, (unsigned long long)g_rc_diag.unknown, (unsigned long long)g_rc_diag.enable,
+         (unsigned long long)g_rc_diag.disable, (unsigned long long)g_rc_diag.draws, (unsigned long long)g_rc_diag.skipped,
+         (unsigned long long)g_rc_diag.no_cb, (unsigned long long)g_rc_diag.frames_skipped, (unsigned long long)g_rc_diag.max_skipped);
+    unsigned windows = g_rc_diag.windows + 1;
+    memset(&g_rc_diag, 0, sizeof g_rc_diag);
+    g_rc_diag.windows = windows;
+}
+static void rc_diag_frame(uint64_t frame) {
+    if (g_rc_diag.windows >= RC_DIAG_WINDOWS) return;
+    if (!g_rc_diag.active) { g_rc_diag.start = g_rc_diag.frame = frame; g_rc_diag.active = 1; return; }
+    if (frame == g_rc_diag.frame) return;
+    if (frame < g_rc_diag.start || frame - g_rc_diag.start >= RC_DIAG_FRAMES) {
+        rc_diag_flush();
+        if (g_rc_diag.windows >= RC_DIAG_WINDOWS) return;
+        g_rc_diag.active = 1; g_rc_diag.start = frame;
+    } else rc_diag_finish_frame();
+    g_rc_diag.frame = frame;
+}
 void vka_exec_sub_frame(uint64_t f) { g_job_frame = f; g_job_frame_set = 1; }
+uint64_t vka_exec_submission_frame(void) { return g_job_frame_set ? g_job_frame : g_frame; }
 uint64_t vka_frame_start_ns(uint64_t f) { unsigned k = f % 64; return atomic_load(&g_fstart_f[k]) == f ? atomic_load(&g_fstart[k]) : 0; }   // now_ns; 0 = not known (vka_perf.c)
 void mtl_set_frame(uint64_t f) {
-    g_frame = f; vka_ctl_frame(f);
+    g_frame = f; vka_draw_mesh_indirect_diag_frame(); vka_ctl_frame(f);
     { if (atomic_load_explicit(&vka_synclog_n, memory_order_relaxed) > 0) VLOG("sync frame %llu begins at %.2f ms", (unsigned long long)f, (now_ns() % 1000000000000ull) / 1e6); }
     static uint64_t f0, d0, rp0, b0, ub0, s0, r0, o0, pc0, ch0, sw0;
     int on = VKA_ENV("DM_VK_STATS", 1) != 0;
@@ -327,9 +368,11 @@ static void rp_end(void) {   // the end of vka_rp_sub_commit
 #define RP_K(i, t0) do { if (vka_rprof_on) g_rp.k[i] += vka_rprof_t() - (t0); } while (0)
 
 void vka_rp_sub_begin(void) {
+    if (g_rc_diag_on < 0) g_rc_diag_on = VKA_ENV("DM_TMP_RC_STATS", 0) != 0;
+    if (g_rc_diag_on) { pthread_mutex_lock(&g_rc_diag_mu); rc_diag_frame(g_job_frame_set ? g_job_frame : g_frame); }
     rp_begin(g_job_frame_set ? g_job_frame : g_frame);
     uint64_t rb_ = RP_T();
-    vka_perf_thread(0); vka_ctl_sub();
+    vka_perf_thread(0); vka_ctl_sub(); vka_draw_mesh_indirect_diag_submission(vka_exec_submission_frame());
     { uint64_t f = g_job_frame_set ? g_job_frame : g_frame; if (atomic_load(&g_fstart_f[f % 64]) != f) { atomic_store(&g_fstart[f % 64], now_ns()); atomic_store(&g_fstart_f[f % 64], f); } }
     g_npost = 0; g_cb = VK_NULL_HANDLE;
     if (!vka_init()) { RP_K(RK_BEGIN, rb_); return; }
@@ -365,6 +408,7 @@ void vka_rp_sub_begin(void) {
     }
     vka_gp_sub_begin(g_cb, g_frame);
     vka_enc_start(g_cb);
+    atomic_store_explicit(&g_mesh_gpu_probe_part_failed, 0, memory_order_relaxed);
     vka_barrier(g_cb);   // the host's writes to guest memory before this submission (made available by the submit), and earlier submissions' writes
     { uint64_t rt_ = RP_T(); vka_tex_prepare(g_cb); RP_K(RK_TEXPREP, rt_); }
     vka_barrier(g_cb);   // the re-uploads of CPU-written textures before the submission's draws read them
@@ -385,7 +429,7 @@ static void part_submit(const void *a) {   // the part ends and goes to the queu
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, pa.q);
     VkResult r = vk.vkEndCommandBuffer(cb);
     if (!r) r = vka_submit(cb, 0, 0, NULL, NULL, NULL, VK_NULL_HANDLE);
-    if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); }
+    if (r) { atomic_store_explicit(&g_mesh_gpu_probe_part_failed, 1, memory_order_release); static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); }
 }
 static void part_begin(const void *a) {
     part_arg pa; memcpy(&pa, a, sizeof pa); VkCommandBuffer cb = pa.cb;
@@ -428,7 +472,7 @@ static inline void chunk_check(void) {
 }
 static uint64_t g_cur_fence;   // the fence of the submission being replayed, reserved before it (vka_worker.c); 0 = reserved at its commit
 static uint64_t sub_commit(uint64_t reserved);
-uint64_t vka_rp_sub_commit(uint64_t reserved) { uint64_t rc_ = RP_T(), f = sub_commit(reserved); RP_K(RK_COMMIT, rc_); rp_end(); return f; }
+uint64_t vka_rp_sub_commit(uint64_t reserved) { uint64_t rc_ = RP_T(), f = sub_commit(reserved); RP_K(RK_COMMIT, rc_); rp_end(); if (g_rc_diag_on) pthread_mutex_unlock(&g_rc_diag_mu); return f; }
 static uint64_t sub_commit(uint64_t reserved) {
     uint64_t fence = reserved ? reserved : vka_fence_next(); g_cur_fence = 0;
     int tail = 0;   // counted for the tail floor (DM_VK_GPU_FLOOR_AUTO=2): given back by the span op when it completes
@@ -452,6 +496,7 @@ static uint64_t sub_commit(uint64_t reserved) {
     vka_floor_commit(tail);
     { uint64_t r_ = RP_T(); vka_up_flush(); vka_up_throttle(); RP_K(RK_C_UP, r_); }   // before the submission that may use what it made
     { uint64_t r_ = RP_T(); if (!r) r = vka_submit(g_cb, fence, 0, NULL, NULL, NULL, VK_NULL_HANDLE); RP_K(RK_C_SUBMIT, r_); }
+    vka_mesh_gpu_probe_commit(fence, !r && !atomic_load_explicit(&g_mesh_gpu_probe_part_failed, memory_order_acquire));
     g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
     if (vka_nan_on()) vka_nan_commit(fence);
     vka_scratch_retire(fence); vka_gmem_retire(fence);
@@ -488,11 +533,13 @@ int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return vka_wait_done(fen
 void mtl_finish(void) { vka_wait_done(vka_fence_last(), UINT64_MAX); }
 void mtl_present_flush(void);
 void vka_pso_pause(int on);
-void mtl_drain(void) { vka_pso_pause(1); vka_pso_save(1); mtl_present_flush(); mtl_finish(); if (vka_ok()) vka_queue_idle(); }
+void mtl_drain(void) { vka_pso_pause(1); vka_pso_save(1); mtl_present_flush(); mtl_finish(); if (vka_ok()) vka_queue_idle(); vka_draw_mesh_indirect_diag_flush();
+    if (g_rc_diag_on > 0) { pthread_mutex_lock(&g_rc_diag_mu); rc_diag_flush(); pthread_mutex_unlock(&g_rc_diag_mu); } }
 
 // ---------- Buffers ----------
 static void buf_copy(uint64_t src, uint64_t dst, uint64_t n) {
     vka_tex_gw_copy(src, dst, n);
+    if (VKA_ENV("DM_VK_MESH_TRANSFER_WATCH", 0)) vka_tex_gw_watch_transfer("copy", dst, n, src);
     while (n) {
         VkBuffer sb, db; VkDeviceSize so, dof;
         uint64_t a = vka_addr_run(src, n, &sb, &so), b = vka_addr_run(dst, n, &db, &dof), k = a < b ? a : b;
@@ -503,6 +550,7 @@ static void buf_copy(uint64_t src, uint64_t dst, uint64_t n) {
 }
 static void buf_fill(uint64_t dst, uint64_t n, uint32_t value) {
     vka_tex_gw_fill(dst, n, value);
+    if (VKA_ENV("DM_VK_MESH_TRANSFER_WATCH", 0)) vka_tex_gw_watch_transfer("fill", dst, n, 0);
     if ((dst | n) & 3) { VRED_ONCE("buffer fill at %#llx of %llu bytes is not 4-byte aligned", (unsigned long long)dst, (unsigned long long)n); return; }
     while (n) {
         VkBuffer b; VkDeviceSize o; uint64_t k = vka_addr_run(dst, n, &b, &o);
@@ -512,6 +560,7 @@ static void buf_fill(uint64_t dst, uint64_t n, uint32_t value) {
 }
 static void buf_update(const void *data, uint64_t dst, uint64_t n) {   // inline data, in GPU order: through scratch memory
     vka_tex_gw_update(dst, n, data);
+    if (VKA_ENV("DM_VK_MESH_TRANSFER_WATCH", 0)) vka_tex_gw_watch_transfer("update", dst, n, 0);
     vka_span s; if (!n || !vka_scratch(n, 16, &s)) return;
     memcpy(s.ptr, data, n);
     for (uint64_t done = 0; done < n;) {
@@ -761,6 +810,7 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
     if (to_tex) { vk.vkCmdCopyBufferToImage(g_cb, bounce ? s.buf : b, im->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, rg); vka_img_written(im); vka_rtw(im, VKA_RTW_COPY); }
     else {
         vka_tex_gw_opaque(c->src, span);
+        if (VKA_ENV("DM_VK_MESH_TRANSFER_WATCH", 0)) vka_tex_gw_watch_transfer("texture_to_buffer", c->src, span, 0);
         vk.vkCmdCopyImageToBuffer(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, bounce ? s.buf : b, (uint32_t)n, rg);
         if (bounce) {
             vka_barrier(g_cb);
@@ -859,8 +909,9 @@ static void exec(const uint8_t *p, int depth) {
             break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_cur_fence ? g_cur_fence : vka_fence_last() + 1; s->fenced = 1; break; }   // the fence this submission commits with
         case OP_RENDER_COND: { const p_render_cond *rc = a;
-            if (rc->mode >= 2) S.rc_skip = rc->mode == 3;
-            else { uint64_t x, y; int known = rc_known(rc->addr, &x) && rc_known(rc->addr + 16, &y); S.rc_skip = known && (rc->mode ? x == y : x != y); }
+            if (rc->mode >= 2) { S.rc_skip = rc->mode == 3; if (g_rc_diag_on && g_rc_diag.windows < RC_DIAG_WINDOWS) { if (S.rc_skip) g_rc_diag.disable++; else g_rc_diag.enable++; } }
+            else { uint64_t x, y; int known = rc_known(rc->addr, &x) && rc_known(rc->addr + 16, &y); S.rc_skip = known && (rc->mode ? x == y : x != y);
+                if (g_rc_diag_on && g_rc_diag.windows < RC_DIAG_WINDOWS) { g_rc_diag.conditions++; g_rc_diag.cond_skip += S.rc_skip; g_rc_diag.unknown += !known; } }
             break; }
         case OP_RESET_COUNTER: break;
         case OP_CLEAR_BUF: if (g_cb) { const p_clear_buf *cb = a; buf_fill(cb->addr, cb->size, cb->value); vka_barrier(g_cb); } break;
@@ -876,8 +927,11 @@ static void exec(const uint8_t *p, int depth) {
         case OP_COPY_T2B: if (g_cb) copy_bt(a, 0); break;
         case OP_COPY_T2T: if (g_cb) copy_t2t(a); break;
         case OP_BARRIER: if (g_cb && !bar_kept) vka_barrier(g_cb); break;
-        case OP_DRAW: if (!S.rc_skip && g_cb) { p_draw t; g_stat_draws++; vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, draw_rec(a, h.size, &t), NULL); } break;
-        case OP_DRAW_IDX: if (!S.rc_skip && g_cb) { p_draw_idx t; g_stat_draws++; vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, NULL, draw_idx_rec(a, h.size, &t)); } break;
+        case OP_DRAW: if (h.size >= 8) { p_draw t; vka_mesh_arg_probe_visit(p, draw_rec(a, h.size, &t)); }
+            if (g_rc_diag_on && g_rc_diag.windows < RC_DIAG_WINDOWS) { if (S.rc_skip) { g_rc_diag.skipped++; g_rc_diag.skipped_frame++; } else if (g_cb) g_rc_diag.draws++; else g_rc_diag.no_cb++; }
+            if (!S.rc_skip && g_cb) { p_draw t; g_stat_draws++; vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, draw_rec(a, h.size, &t), NULL); } break;
+        case OP_DRAW_IDX: if (g_rc_diag_on && g_rc_diag.windows < RC_DIAG_WINDOWS) { if (S.rc_skip) { g_rc_diag.skipped++; g_rc_diag.skipped_frame++; } else if (g_cb) g_rc_diag.draws++; else g_rc_diag.no_cb++; }
+            if (!S.rc_skip && g_cb) { p_draw_idx t; g_stat_draws++; vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, NULL, draw_idx_rec(a, h.size, &t)); } break;
         case OP_DISPATCH: if (g_cb) vka_dispatch(&S.d, a); break;
         case OP_DRAW_TEX: not_yet(h.op); break;
         default: break;   // state: taken by vka_state_op above

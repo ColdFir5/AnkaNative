@@ -57,6 +57,26 @@ vka_dev V = {.qmu = PTHREAD_MUTEX_INITIALIZER};
 static int g_state;   // 0 not tried, 1 up, -1 failed
 static pthread_mutex_t g_init_mu = PTHREAD_MUTEX_INITIALIZER;
 
+enum { TMP_PIPE_STATS_MAX = 64 };
+static uint64_t g_tmp_pipe_stats_keys[TMP_PIPE_STATS_MAX];
+static int g_tmp_pipe_stats_n;
+int tmp_pipe_stats_has(uint64_t key) {
+    if (!V.tmp_pipe_stats || !key) return 0;
+    for (int i = 0; i < g_tmp_pipe_stats_n; i++) if (g_tmp_pipe_stats_keys[i] == key) return 1;
+    return 0;
+}
+static void tmp_pipe_stats_parse(const char *s) {
+    g_tmp_pipe_stats_n = 0;
+    while (s && *s && g_tmp_pipe_stats_n < TMP_PIPE_STATS_MAX) {
+        while (*s == ',' || *s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        char *e = NULL; uint64_t k = strtoull(s, &e, 16);
+        if (e != s && (*e == '\0' || *e == ',' || *e == ' ' || *e == '\t') && k) g_tmp_pipe_stats_keys[g_tmp_pipe_stats_n++] = k;
+        while (*e && *e != ',') e++;
+        s = e;
+    }
+}
+
 
 uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
     for (uint32_t i = 0; i < V.memp.memoryTypeCount; i++)
@@ -199,6 +219,10 @@ static int init_once(void) {
     const char *mr_env = getenv("DM_VK_MEMREPORT"); int x_mr = mr_env && !strcmp(mr_env, "1") && has_ext(de, nde, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME);
     if (x_mr && !(g_mr = calloc(MR_SLOTS, sizeof *g_mr))) x_mr = 0;
     if (x_mr) dext[ndext++] = VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME;
+    const char *tmp_ps_env = getenv("DM_TMP_PIPE_STATS");
+    if (tmp_ps_env && tmp_ps_env[0]) tmp_pipe_stats_parse(tmp_ps_env);
+    int tmp_ps_ext = g_tmp_pipe_stats_n > 0 && has_ext(de, nde, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    if (tmp_ps_ext) dext[ndext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
     free(de);
 
     // Every feature the device has, but robustness and capture-replay (they cost and nothing needs them); the shader side takes what it needs from the same device
@@ -213,7 +237,8 @@ static int init_once(void) {
 #define LINK(on, st) if (on) { (st).pNext = chain; chain = &(st); }
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
     VkPhysicalDeviceDeviceMemoryReportFeaturesEXT fmr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_MEMORY_REPORT_FEATURES_EXT};
-    LINK(x_mr, fmr)
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR tmp_fps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    LINK(x_mr, fmr) LINK(tmp_ps_ext, tmp_fps)
     LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
@@ -234,6 +259,7 @@ static int init_once(void) {
     if (!f12.timelineSemaphore || !f13.dynamicRendering) { VRED("the device lacks timeline semaphores (%d) or dynamic rendering (%d)", f12.timelineSemaphore, f13.dynamicRendering); return 0; }
     V.bda = f12.bufferDeviceAddress; V.uab = f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingPartiallyBound && f12.runtimeDescriptorArray;
     V.placed = placed && fmp.memoryMapPlaced; V.placed_range = placed && fmp.memoryMapRangePlaced; V.unmap_reserve = placed && fmp.memoryUnmapReserve;
+    V.tmp_pipe_stats = tmp_ps_ext && tmp_fps.pipelineExecutableInfo;
     float prio = 1.f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = V.qf, .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = ndext, .ppEnabledExtensionNames = dext};
@@ -245,6 +271,9 @@ static int init_once(void) {
 #define D(f) vk.f = (PFN_##f)vk.vkGetDeviceProcAddr(V.dev, #f);
     VKA_DEVICE_FNS(D)
 #undef D
+    if (V.tmp_pipe_stats && (!vk.vkGetPipelineExecutablePropertiesKHR || !vk.vkGetPipelineExecutableStatisticsKHR)) V.tmp_pipe_stats = 0;
+    if (tmp_ps_env && tmp_ps_env[0])
+        VLOG("TEMP pipe stats (DM_TMP_PIPE_STATS): %s", V.tmp_pipe_stats ? "on" : !g_tmp_pipe_stats_n ? "off (no valid keys)" : !tmp_ps_ext ? "asked for, not on this driver" : !tmp_fps.pipelineExecutableInfo ? "asked for, feature not supported" : "asked for, entry points missing");
     if (!vk.vkMapMemory2KHR) vk.vkMapMemory2KHR = (PFN_vkMapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkMapMemory2");   // core in 1.4
     if (!vk.vkUnmapMemory2KHR) vk.vkUnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkUnmapMemory2");
     if (!vk.vkMapMemory2KHR || !vk.vkUnmapMemory2KHR) V.placed = V.placed_range = 0;
@@ -279,6 +308,10 @@ static int init_once(void) {
     if (V.mesh) { V.mesh_inv = pmesh.maxMeshWorkGroupInvocations; V.task_inv = pmesh.maxTaskWorkGroupInvocations; V.mesh_out_v = pmesh.maxMeshOutputVertices;
                   V.mesh_out_p = pmesh.maxMeshOutputPrimitives; V.task_payload = pmesh.maxTaskPayloadSize;
                   V.task_groups = pmesh.maxTaskWorkGroupCount[0]; V.mesh_groups = pmesh.maxMeshWorkGroupCount[0]; }
+    // A driver that reads NVN's two-word {count, first} mesh indirect records itself (our Turnip build, tu_mesh.h TU_MESH_NV_INDIRECT_STRIDE): it says so in driverInfo, and
+    // vkCmdDrawMeshTasksIndirectEXT with drawCount 1 and the stride VKA_MESH_NV_STRIDE then reads the record in GPU order (after the compute shaders that write it)
+    V.mesh_nv_ind = V.mesh && vk.vkCmdDrawMeshTasksIndirectEXT && strstr(pdr.driverInfo, " +nv-mesh-indirect") != NULL;
+    VLOG("mesh indirect draws: %s", V.mesh_nv_ind ? "read by the GPU in command order (the driver takes NVN's {count, first} records; DM_VK_MESH_GPU_IND=0 reads them on the CPU)" : "arguments read on the CPU at replay");
     VLOG("mesh shading (NVN2 task and mesh programs): %s", V.task ? "on" : V.mesh ? "mesh shaders only (no taskShader)" : !mesh_ext ? "not on this device" : !x_mesh ? "off (DM_VK_MESH=0)" : "extension without the mesh stage");
     if (V.mesh) VLOG("mesh shading limits: workgroups mesh %u / task %u invocations, mesh output %u vertices / %u primitives / %u components / %u bytes, task payload %u bytes, mesh shared %u bytes",
                      V.mesh_inv, V.task_inv, V.mesh_out_v, V.mesh_out_p, pmesh.maxMeshOutputComponents, pmesh.maxMeshOutputMemorySize, V.task_payload, pmesh.maxMeshSharedMemorySize);
@@ -339,14 +372,22 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
     VkSemaphore ws[9]; uint64_t wv[9]; VkPipelineStageFlags wst[9];
     if (nwait > 8) { VRED_ONCE("vka_submit: %u waits, at most 8 taken: the rest are dropped", nwait); nwait = 8; }
     for (uint32_t i = 0; i < nwait; i++) { ws[i] = wait[i]; wv[i] = wait_vals[i]; wst[i] = stages[i]; }
+    struct timespec tq0, tq1, tq2; clock_gettime(CLOCK_MONOTONIC, &tq0);   // TEMP probe: queue lock wait vs submit
     pthread_mutex_lock(&V.qmu);
-    vks_queue_locked(&nwait, ws, wv, wst);
+    clock_gettime(CLOCK_MONOTONIC, &tq1);
+    uint32_t nw0 = nwait; vks_queue_locked(&nwait, ws, wv, wst);
+    struct timespec tqb; clock_gettime(CLOCK_MONOTONIC, &tqb);
+    { static double bt; static int bn, bs; bt += (tqb.tv_sec - tq1.tv_sec) * 1e3 + (tqb.tv_nsec - tq1.tv_nsec) / 1e6; bs += nwait > nw0; if (++bn == 300) { extern int vks_tmp_batches, vks_tmp_binds; VLOG("TEMP probe binds: 300 submits, %d with a sparse bind wait, %d bind batches (%d binds), %.1f ms in vks_queue_locked", bs, vks_tmp_batches, vks_tmp_binds, bt); vks_tmp_batches = vks_tmp_binds = 0; bt = 0; bn = bs = 0; } }
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = nwait, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = ns, .pSignalSemaphoreValues = sv};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = nwait, .pWaitSemaphores = ws, .pWaitDstStageMask = wst,
                        .commandBufferCount = cb ? 1 : 0, .pCommandBuffers = &cb, .signalSemaphoreCount = ns, .pSignalSemaphores = sig};
     VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE);
     if (!r && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&V.qmu);
+    clock_gettime(CLOCK_MONOTONIC, &tq2);
+    { static double lw, sb, lwm, sbm; static int n; double a = (tq1.tv_sec - tq0.tv_sec) * 1e3 + (tq1.tv_nsec - tq0.tv_nsec) / 1e6, b = (tq2.tv_sec - tq1.tv_sec) * 1e3 + (tq2.tv_nsec - tq1.tv_nsec) / 1e6;
+      lw += a; sb += b; if (a > lwm) lwm = a; if (b > sbm) sbm = b;
+      if (++n == 300) { VLOG("TEMP probe submit: 300 submits, lock wait %.1f ms (max %.1f), vkQueueSubmit %.1f ms (max %.1f)", lw, lwm, sb, sbm); lw = sb = lwm = sbm = 0; n = 0; } }
     return r;
 }
 // The queue idle, bounded by the hang time: the timeline up to the last value handed to it (the present's copies wait for no more), then vkQueueWaitIdle for the rest.

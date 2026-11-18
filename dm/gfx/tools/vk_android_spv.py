@@ -1,7 +1,7 @@
 """SPIR-V reading and the few rewrites the Android Vulkan library needs (vk_android_build.py): the descriptor set / binding renumbering into the Vulkan ABI
 (dm/gfx/nvn/dmsh_abi_vk.h), vertex outputs that start as (0, 0, 0, 1), the GL depth and alpha test constants, the integer-output and dual-source variants, the
 viewport mask of an emulated passthrough geometry shader, and the facts the reflection reads (resources, vertex inputs, colour outputs, capabilities). The translator's modules are taken as they come; every rewrite keeps the module valid for spirv-val --target-env vulkan1.3."""
-import array, itertools, struct, sys
+import array, itertools, re, struct, sys
 
 MAGIC = 0x07230203
 _WORDS_LE = array.array('I').itemsize == 4 and sys.byteorder == 'little'   # (Module.data / parse through array: the words as they are in memory)
@@ -1344,7 +1344,10 @@ def gmem_loop_stage(m, map_var, stage, cache=None, pidx=None):
     or the page index, searches left as they are)"""
     if stage in GMEM_LOOP_STAGES: return gmem_loop(m, map_var), 0, 0
     if map_var is None: return 0, 0, 0
-    if GMEM_PIDX if pidx is None else pidx: n = gmem_pidx(m, map_var); return 0, n, gmem_loop(Module(m.data()), map_var)   # (left: the searches it refused)
+    if GMEM_PIDX if pidx is None else pidx:
+        n = gmem_pidx(m, map_var)
+        if n and GMEM_COALESCE: gmem_coalesce(m, map_var)
+        return 0, n, gmem_loop(Module(m.data()), map_var)   # (left: the searches it refused)
     if GMEM_CACHE if cache is None else cache: return 0, gmem_cache(m, map_var), 0
     return 0, 0, gmem_loop(Module(m.data()), map_var)
 
@@ -1588,6 +1591,352 @@ def _result_id(x):   # the id an instruction defines (types and constants do not
     if op == OP_LABEL_: return x[1]
     if op in NO_RESULT_OPS or op in (OP_BRANCH_, OP_BRANCH_COND_, OP_LOOP_MERGE_, OP_SELECTION_MERGE, 251, 252, 255): return None
     return x[2] if len(x) > 2 else None
+
+
+GMEM_COALESCE = True   # coalesce gmem_pidx helper calls sharing one base address within a basic block
+SC_PHYSICAL_STORAGE_BUFFER = 5349
+OP_ULESS_THAN_EQUAL = 178
+
+
+def _is_mem_barrier_or_write(m, defs, x):
+    """True if x writes guest memory, synchronizes, or calls a non-pure function (must split coalesce groups)."""
+    op = x[0] & 0xffff
+    if op in (OP_CONTROL_BARRIER, OP_MEMORY_BARRIER, OP_IMAGE_WRITE): return True
+    if 227 <= op <= 243 or op in (5614, 5615, 5616, 6035): return True   # OpAtomic*
+    if op == OP_STORE:
+        ptr = x[1]
+        if ptr in m.vars: return m.pointee(m.vars[ptr][0])[0] != SC_FUNCTION
+        dx = defs.get(ptr)
+        if dx is not None and dx[1] in m.types: return m.pointee(dx[1])[0] != SC_FUNCTION
+        return True
+    return False
+
+
+def _find_pidx_helpers(m, map_var):
+    """Identify pure read-only gmem_pidx helper functions in m.
+    → {fn_id: (ret_t, param_ptr_t, param_t, chain_op, chain_ptr_t, chain_idx0, i32_t, word_t, psb_ptr_t, ulong_t)}"""
+    entry = m.entry_function()
+    c_pidx = {cid for cid, (_, words) in m.consts.items() if words == [GMEM_PIDX_WORD]}
+    helpers = {}
+    if not c_pidx: return helpers
+    for f in [x[2] for x in m.ins if x[0] & 0xffff == OP_FUNCTION and x[2] != entry]:
+        a, e = m.function_range(f)
+        body = m.ins[a:e + 1]
+        ret_t = body[0][1]
+        if m.int_type(ret_t) not in ((32, 0), (32, 1)) and not (m.op(ret_t) == OP_TYPE_FLOAT and m.types[ret_t][2] == 32):
+            continue
+        params = [x for x in body[1:] if x[0] & 0xffff == OP_FUNCTION_PARAMETER]
+        if len(params) != 2 or params[0][1] != params[1][1]: continue
+        param_ptr_t = params[0][1]
+        if m.op(param_ptr_t) != OP_TYPE_POINTER: continue
+        sc, param_t = m.pointee(param_ptr_t)
+        if sc != SC_FUNCTION or m.int_type(param_t) not in ((32, 0), (32, 1)): continue
+        defs = {_result_id(x): x for x in body if _result_id(x) is not None and x[0] & 0xffff != OP_LABEL}
+        if any((x[0] & 0xffff) == OP_FUNCTION_CALL or _is_mem_barrier_or_write(m, defs, x) for x in body):
+            continue
+        if not any(c in x[3:] for c in c_pidx for x in body): continue
+        chain = next((x for x in body if x[0] & 0xffff in (OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN) and len(x) == 6 and x[3] == map_var), None)
+        if chain is None: continue
+        psb_load = None
+        for x in body:
+            if x[0] & 0xffff == OP_LOAD and x[3] in defs and defs[x[3]][0] & 0xffff == OP_CONVERT_U_TO_PTR:
+                pt = defs[x[3]][1]
+                if m.op(pt) == OP_TYPE_POINTER and m.pointee(pt)[0] == SC_PHYSICAL_STORAGE_BUFFER and m.int_type(m.pointee(pt)[1]) == (32, 0):
+                    psb_load = (x, defs[x[3]])
+                    break
+        if psb_load is None: continue
+        ld, conv = psb_load
+        word_t, psb_ptr_t = ld[1], conv[1]
+        ulong_t = defs[conv[3]][1] if conv[3] in defs else m.consts.get(conv[3], (None,))[0]
+        if m.int_type(ulong_t) != (64, 0): continue
+        idx0 = chain[4]
+        i32_t = m.consts[idx0][0] if idx0 in m.consts else None
+        if i32_t is None: continue
+        helpers[f] = (ret_t, param_ptr_t, param_t, chain[0] & 0xffff, chain[1], idx0, i32_t, word_t, psb_ptr_t, ulong_t)
+    return helpers
+
+
+def _strip_cast(defs, v):
+    while v in defs and (defs[v][0] & 0xffff) in (OP_BITCAST, OP_COPY_OBJECT):
+        v = defs[v][3]
+    return v
+
+
+def _match_base_offset(m, defs, lo_v, hi_v):
+    """Match (lo_v, hi_v) as (base_lo, base_hi) + K with unsigned 32-bit carry.
+    → (base_lo_id, base_hi_id, K) with 0 <= K <= 4092 (falls back to (lo_r, hi_r, 0) if unrecognized)."""
+    lo_r = _strip_cast(defs, lo_v)
+    hi_r = _strip_cast(defs, hi_v)
+    x_lo = defs.get(lo_r)
+    x_hi = defs.get(hi_r)
+    if x_lo and (x_lo[0] & 0xffff) == OP_IADD and len(x_lo) == 5:
+        for base_cand, k_cand in ((x_lo[3], x_lo[4]), (x_lo[4], x_lo[3])):
+            c = m.consts.get(k_cand)
+            if c is None or len(c[1]) != 1: continue
+            k_val = c[1][0]
+            if k_val > 4092: continue
+            if x_hi and (x_hi[0] & 0xffff) == OP_IADD and len(x_hi) == 5:
+                for bh_cand, c_cand in ((x_hi[3], x_hi[4]), (x_hi[4], x_hi[3])):
+                    xc = defs.get(_strip_cast(defs, c_cand))
+                    if xc and (xc[0] & 0xffff) == OP_SELECT and len(xc) == 6:
+                        c1 = m.consts.get(xc[4], (0, [None]))[1][0]
+                        c0 = m.consts.get(xc[5], (0, [None]))[1][0]
+                        if c1 == 1 and c0 == 0:
+                            xcmp = defs.get(xc[3])
+                            if xcmp and (xcmp[0] & 0xffff) == OP_ULESS_THAN and len(xcmp) == 5:
+                                lhs = _strip_cast(defs, xcmp[3])
+                                rhs = _strip_cast(defs, xcmp[4])
+                                b_lo_r = _strip_cast(defs, base_cand)
+                                if lhs == lo_r and (rhs == b_lo_r or rhs == k_cand):
+                                    return (b_lo_r, _strip_cast(defs, bh_cand), k_val)
+    return (lo_r, hi_r, 0)
+
+
+def gmem_coalesce(m, map_var):
+    """Coalesce gmem_pidx helper calls in the same basic block that share one 64-bit base address (base + K).
+    Emits one page-index lookup per group with a page-bounds check ((base_lo & 4095) + Kmax + 4 <= 4096 and valid);
+    fast path loads each word directly via PhysicalStorageBuffer, slow path falls back to the original helper calls.
+    → (calls_before, calls_after)"""
+    if map_var is None:
+        m.gmem_coalesce_stats = (0, 0)
+        return 0, 0
+    helpers = _find_pidx_helpers(m, map_var)
+    if not helpers:
+        m.gmem_coalesce_stats = (0, 0)
+        return 0, 0
+
+    entry = m.entry_function()
+    boolean = m.add_type(OP_TYPE_BOOL)
+    page_shift = GMEM_PIDX_SHIFT
+    page_size = 1 << page_shift
+    page_mask = page_size - 1
+    hi_mask = ((1 << 32) - 1) ^ page_mask
+    glsl = ensure_glsl(m)
+
+    calls_before = 0
+    calls_after = 0
+    changed = False
+
+    for f in [x[2] for x in m.ins if x[0] & 0xffff == OP_FUNCTION]:
+        if f in helpers: continue
+        a, e = m.function_range(f)
+        body = m.ins[a:e + 1]
+        if not any((x[0] & 0xffff) == OP_FUNCTION_CALL and x[3] in helpers for x in body):
+            continue
+
+        defs = {}
+        types = {cid: t for cid, (t, _) in m.consts.items()}
+        for x in body:
+            op = x[0] & 0xffff
+            if op == OP_FUNCTION_PARAMETER:
+                types[x[2]] = x[1]
+            else:
+                r = _result_id(x)
+                if r is not None and op != OP_LABEL:
+                    defs[r] = x
+                    types[r] = x[1]
+
+        first_lbl = next(i for i, x in enumerate(body) if (x[0] & 0xffff) == OP_LABEL)
+        head = body[:first_lbl]
+        end = body[-1]
+        blocks = []
+        cur = []
+        for x in body[first_lbl:-1]:
+            if (x[0] & 0xffff) == OP_LABEL:
+                if cur: blocks.append(cur)
+                cur = [x]
+            else:
+                cur.append(x)
+        if cur: blocks.append(cur)
+
+        fn_changed = False
+        tmp_vars = {}   # param_ptr_t -> (tmp_lo, tmp_hi)
+        last_lbl = {}   # orig_blk_lbl -> final_tail_lbl
+        new_blocks = []
+
+        for blk in blocks:
+            orig_lbl = blk[0][1]
+            has_loop_merge = len(blk) >= 3 and (blk[-2][0] & 0xffff) == OP_LOOP_MERGE
+            if has_loop_merge:
+                for x in blk:
+                    if (x[0] & 0xffff) == OP_FUNCTION_CALL and x[3] in helpers:
+                        calls_before += 1
+                        calls_after += 1
+                new_blocks.append(blk)
+                continue
+
+            var_val = {}
+            epoch = 0
+            groups = {}
+            blk_calls = 0
+            for idx, x in enumerate(blk):
+                op = x[0] & 0xffff
+                if op == OP_STORE and len(x) >= 3:
+                    ptr = x[1]
+                    if ptr in m.vars or (ptr in defs and defs[ptr][0] & 0xffff == OP_VARIABLE):
+                        sc = m.pointee(m.vars[ptr][0] if ptr in m.vars else defs[ptr][1])[0]
+                        if sc == SC_FUNCTION:
+                            var_val[ptr] = x[2]
+                            continue
+                    epoch += 1
+                elif op == OP_FUNCTION_CALL and x[3] in helpers:
+                    blk_calls += 1
+                    calls_before += 1
+                    vlo, vhi = var_val.get(x[4]), var_val.get(x[5])
+                    if vlo is not None and vhi is not None:
+                        b_lo, b_hi, k = _match_base_offset(m, defs, vlo, vhi)
+                        groups.setdefault((epoch, x[3], b_lo, b_hi), []).append((idx, x[2], k))
+                else:
+                    if op == OP_FUNCTION_CALL:
+                        for arg in x[4:]:
+                            var_val.pop(arg, None)
+                    if op == OP_FUNCTION_CALL or _is_mem_barrier_or_write(m, defs, x):
+                        epoch += 1
+
+            multi = sorted((items for items in groups.values() if len(items) >= 2), key=lambda items: items[0][0])
+            if not multi:
+                calls_after += blk_calls
+                new_blocks.append(blk)
+                continue
+
+            fn_changed = True
+            changed = True
+            calls_after += blk_calls - sum(len(items) - 1 for items in multi)
+
+            cur_blk = list(blk)
+            cur_lbl = orig_lbl
+            for items in multi:
+                # Reconstruct key info from first item
+                first_idx, first_res, _ = items[0]
+                pos = next(i for i, x in enumerate(cur_blk) if (x[0] & 0xffff) == OP_FUNCTION_CALL and x[2] == first_res)
+                callee = cur_blk[pos][3]
+                ret_t, param_ptr_t, param_t, chain_op, chain_ptr_t, chain_idx0, i32_t, word_t, psb_ptr_t, ulong_t = helpers[callee]
+                v2_t = m.add_type(OP_TYPE_VECTOR, word_t, 2)
+
+                if param_ptr_t not in tmp_vars:
+                    tmp_vars[param_ptr_t] = (m.new_id(), m.new_id())
+                tmp_lo, tmp_hi = tmp_vars[param_ptr_t]
+
+                # Recover base_lo, base_hi for this group from original block
+                # (stored at group creation via a lookup; re-derive cleanly from first call)
+                b_lo, b_hi = next(k[2:] for k, v in groups.items() if v is items)
+                k_max = max(k for _, _, k in items)
+
+                rem_ids = {res for _, res, _ in items[1:]}
+                prefix = cur_blk[:pos]
+                suffix = [x for x in cur_blk[pos + 1:] if not ((x[0] & 0xffff) == OP_FUNCTION_CALL and x[2] in rem_ids)]
+
+                def wc(v): return m.add_const(word_t, v)
+                def em_to(dst, op, t, *ops):
+                    r = m.new_id()
+                    dst.append([(3 + len(ops)) << 16 | op, t, r, *ops])
+                    return r
+
+                # Page lookup in prefix
+                lo_u = b_lo if types.get(b_lo) == word_t else em_to(prefix, OP_BITCAST, word_t, b_lo)
+                hi_u = b_hi if types.get(b_hi) == word_t else em_to(prefix, OP_BITCAST, word_t, b_hi)
+
+                def table_word(dst, w):
+                    idx_i = em_to(dst, OP_BITCAST, i32_t, w)
+                    ch = em_to(dst, chain_op, chain_ptr_t, map_var, chain_idx0, idx_i)
+                    return em_to(dst, OP_LOAD, word_t, ch)
+
+                w_base = table_word(prefix, wc(GMEM_PIDX_WORD))
+                w_pages = table_word(prefix, wc(GMEM_PIDX_WORD + 1))
+                hi_clamped = em_to(prefix, OP_EXT_INST, word_t, glsl, GLSL_UMIN, hi_u, wc(page_mask))
+                page = em_to(prefix, OP_BITWISE_OR, word_t,
+                             em_to(prefix, OP_SHL_LOGICAL, word_t, hi_clamped, wc(32 - page_shift)),
+                             em_to(prefix, OP_SHR_LOGICAL, word_t, lo_u, wc(page_shift)))
+                pg = em_to(prefix, OP_EXT_INST, word_t, glsl, GLSL_UMIN, em_to(prefix, OP_ISUB, word_t, page, w_base), w_pages)
+                rec = em_to(prefix, OP_IADD, word_t, em_to(prefix, OP_SHL_LOGICAL, word_t, pg, wc(1)), wc(GMEM_PIDX_WORD + 4))
+                p_lo = table_word(prefix, rec)
+                p_hi = table_word(prefix, em_to(prefix, OP_IADD, word_t, rec, wc(1)))
+                valid = em_to(prefix, OP_INOT_EQUAL, boolean, em_to(prefix, OP_BITWISE_AND, word_t, p_lo, wc(1)), wc(0))
+                page_off = em_to(prefix, OP_BITWISE_AND, word_t, lo_u, wc(page_mask))
+                in_page = em_to(prefix, OP_ULESS_THAN_EQUAL, boolean, page_off, wc(page_size - 4 - k_max))
+                fast_cond = em_to(prefix, OP_LOGICAL_AND, boolean, valid, in_page)
+
+                fast_lbl, slow_lbl, merge_lbl = m.new_id(), m.new_id(), m.new_id()
+                prefix.append([3 << 16 | OP_SELECTION_MERGE, merge_lbl, 0])
+                prefix.append([4 << 16 | OP_BRANCH_CONDITIONAL, fast_cond, fast_lbl, slow_lbl])
+                new_blocks.append(prefix)
+
+                # Fast path block
+                fast_blk = [[2 << 16 | OP_LABEL, fast_lbl]]
+                p_lo_masked = em_to(fast_blk, OP_BITWISE_AND, word_t, p_lo, wc(hi_mask))
+                phys_base_lo = em_to(fast_blk, OP_BITWISE_OR, word_t, p_lo_masked, page_off)
+                fast_cache = {}
+                fast_res = []
+                for _, _, k in items:
+                    if k in fast_cache:
+                        fast_res.append(fast_cache[k])
+                        continue
+                    phys_lo_k = phys_base_lo if k == 0 else em_to(fast_blk, OP_IADD, word_t, phys_base_lo, wc(k))
+                    addr_v2 = em_to(fast_blk, OP_COMPOSITE_CONSTRUCT, v2_t, phys_lo_k, p_hi)
+                    addr_u64 = em_to(fast_blk, OP_BITCAST, ulong_t, addr_v2)
+                    ptr_k = em_to(fast_blk, OP_CONVERT_U_TO_PTR, psb_ptr_t, addr_u64)
+                    ld_k = m.new_id()
+                    fast_blk.append([6 << 16 | OP_LOAD, word_t, ld_k, ptr_k, 2, 4])
+                    res_k = ld_k if ret_t == word_t else em_to(fast_blk, OP_BITCAST, ret_t, ld_k)
+                    fast_cache[k] = res_k
+                    fast_res.append(res_k)
+                fast_blk.append([2 << 16 | OP_BRANCH, merge_lbl])
+                new_blocks.append(fast_blk)
+
+                # Slow path block
+                slow_blk = [[2 << 16 | OP_LABEL, slow_lbl]]
+                slow_res = []
+                for _, _, k in items:
+                    if k == 0:
+                        lo_k, hi_k = lo_u, hi_u
+                    else:
+                        lo_k = em_to(slow_blk, OP_IADD, word_t, lo_u, wc(k))
+                        carry_b = em_to(slow_blk, OP_ULESS_THAN, boolean, lo_k, lo_u)
+                        carry_u = em_to(slow_blk, OP_SELECT, word_t, carry_b, wc(1), wc(0))
+                        hi_k = em_to(slow_blk, OP_IADD, word_t, hi_u, carry_u)
+                    st_lo = lo_k if param_t == word_t else em_to(slow_blk, OP_BITCAST, param_t, lo_k)
+                    st_hi = hi_k if param_t == word_t else em_to(slow_blk, OP_BITCAST, param_t, hi_k)
+                    slow_blk.append([3 << 16 | OP_STORE, tmp_lo, st_lo])
+                    slow_blk.append([3 << 16 | OP_STORE, tmp_hi, st_hi])
+                    sr = em_to(slow_blk, OP_FUNCTION_CALL, ret_t, callee, tmp_lo, tmp_hi)
+                    slow_res.append(sr)
+                slow_blk.append([2 << 16 | OP_BRANCH, merge_lbl])
+                new_blocks.append(slow_blk)
+
+                # Merge block becomes cur_blk for any remaining groups in this original block
+                merge_blk = [[2 << 16 | OP_LABEL, merge_lbl]]
+                for (_, orig_res, _), fr, sr in zip(items, fast_res, slow_res):
+                    merge_blk.append([7 << 16 | OP_PHI, ret_t, orig_res, fr, fast_lbl, sr, slow_lbl])
+                merge_blk.extend(suffix)
+                cur_blk = merge_blk
+                cur_lbl = merge_lbl
+
+            new_blocks.append(cur_blk)
+            if cur_lbl != orig_lbl:
+                last_lbl[orig_lbl] = cur_lbl
+
+        if fn_changed:
+            if tmp_vars:
+                ins_vars = []
+                for param_ptr_t, (tmp_lo, tmp_hi) in tmp_vars.items():
+                    ins_vars.append([4 << 16 | OP_VARIABLE, param_ptr_t, tmp_lo, SC_FUNCTION])
+                    ins_vars.append([4 << 16 | OP_VARIABLE, param_ptr_t, tmp_hi, SC_FUNCTION])
+                new_blocks[0][1:1] = ins_vars
+            rebuilt = list(head)
+            for blk in new_blocks:
+                for x in blk:
+                    if last_lbl and (x[0] & 0xffff) == OP_PHI:
+                        for j in range(4, len(x), 2):
+                            if x[j] in last_lbl: x[j] = last_lbl[x[j]]
+                    rebuilt.append(x)
+            rebuilt.append(end)
+            a, e = m.function_range(f)
+            m.ins[a:e + 1] = rebuilt
+
+    if changed:
+        m.index()
+    m.gmem_coalesce_stats = (calls_before, calls_after)
+    return calls_before, calls_after
 
 
 def _cache_plan(m, body, mt, map_var):
@@ -2087,4 +2436,308 @@ def tex_feedback(m, pool_set, pool_binding, fb_binding, spec_id):
         m.ins[a:e + 1] = out
     m.index()
     return marked, sites
+
+
+# ---- per-key constant-buffer element scaling (DMSH_VK_CB_SCALE)
+_CB_COMP = {'x': 0, 'y': 1, 'z': 2, 'w': 3, '0': 0, '1': 1, '2': 2, '3': 3}
+
+
+def parse_cb_scale(spec):
+    """Parse DMSH_VK_CB_SCALE="<key>:<cbuf>:<vec>.<comp>[,<vec>.<comp>...]:<factor>[;<another rule>]".
+    → ({key: [(cbuf, vec, comp, factor), ...]}, {key: canonical_rule_str})"""
+    rules, raw = {}, {}
+    if not spec or not spec.strip(): return rules, raw
+    for part in spec.split(';'):
+        part = part.strip()
+        if not part: continue
+        fields = [f.strip() for f in part.split(':')]
+        if len(fields) != 4 or not all(fields):
+            raise ValueError(f'DMSH_VK_CB_SCALE: expected <key>:<cbuf>:<vec>.<comp>[,...]:<factor>, got {part!r}')
+        key, cbuf, elems, fac_s = fields
+        key = key.lower()
+        factor = float(fac_s)
+        for el in elems.split(','):
+            el = el.strip()
+            if '.' not in el: raise ValueError(f'DMSH_VK_CB_SCALE: expected <vec>.<comp>, got {el!r}')
+            vs, cs = el.split('.', 1)
+            vec = int(vs)
+            c = _CB_COMP.get(cs.lower())
+            if c is None: raise ValueError(f'DMSH_VK_CB_SCALE: bad component {cs!r} in {el!r}')
+            rules.setdefault(key, []).append((cbuf, vec, c, factor))
+        raw[key] = (raw[key] + ';' if key in raw else '') + f'{cbuf}:{elems}:{fac_s}'
+    return rules, raw
+
+
+def cb_scale(m, rules):
+    """Scale float loads from matching constant-buffer elements (Uniform variable cp_c<N>, member 0, vec4 index vec, component comp) by factor: inserts OpFMul right
+    after each matching OpLoad (or OpCompositeExtract of a vec4 OpLoad) and redirects its uses to the product. → number of loads scaled"""
+    if not rules: return 0
+    f32 = m.find_type(OP_TYPE_FLOAT, 32)
+    if f32 is None: return 0
+    targets = {}   # (var_id, vec, comp) -> factor
+    for vid, (_, sc) in m.vars.items():
+        if sc != SC_UNIFORM: continue
+        nm = m.names.get(vid, '')
+        for cbuf, vec, comp, factor in rules:
+            if re.fullmatch(r'(?:[a-z]+_)?' + re.escape(cbuf), nm): targets[(vid, vec, comp)] = factor
+    if not targets: return 0
+
+    ac_scalar, ac_vec4, vec_loads, scale_at = {}, {}, {}, {}
+    for x in m.ins:
+        op = x[0] & 0xffff
+        if op in (OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN):
+            base = x[3]
+            if len(x) == 7 and any(v == base for v, _, _ in targets):
+                idx = [const_int(m, i) for i in x[4:]]
+                if idx[0] == 0 and (base, idx[1], idx[2]) in targets and m.pointee(x[1])[1] == f32:
+                    ac_scalar[x[2]] = targets[(base, idx[1], idx[2])]
+            elif len(x) == 6 and any(v == base for v, _, _ in targets):
+                idx = [const_int(m, i) for i in x[4:]]
+                pt = m.pointee(x[1])[1]
+                if idx[0] == 0 and idx[1] is not None and any(v == base and vc == idx[1] for v, vc, _ in targets) and m.op(pt) == OP_TYPE_VECTOR and m.types[pt][2] == f32:
+                    ac_vec4[x[2]] = (base, idx[1])
+            elif len(x) == 5 and base in ac_vec4:
+                c = const_int(m, x[4])
+                vid, vec = ac_vec4[base]
+                if c is not None and (vid, vec, c) in targets and m.pointee(x[1])[1] == f32:
+                    ac_scalar[x[2]] = targets[(vid, vec, c)]
+        elif op == OP_LOAD:
+            if x[3] in ac_scalar and x[1] == f32: scale_at[x[2]] = ac_scalar[x[3]]
+            elif x[3] in ac_vec4: vec_loads[x[2]] = ac_vec4[x[3]]
+        elif op == OP_COMPOSITE_EXTRACT and len(x) == 5 and x[1] == f32 and x[3] in vec_loads:
+            vid, vec = vec_loads[x[3]]
+            if (vid, vec, x[4]) in targets: scale_at[x[2]] = targets[(vid, vec, x[4])]
+    if not scale_at: return 0
+
+    fconsts = {fac: m.add_const(f32, struct.unpack('<I', struct.pack('<f', fac))[0]) for fac in set(scale_at.values())}
+    ren = {tid: m.new_id() for tid in scale_at}
+    rkeys = ren.keys()
+    for fid in [x[2] for x in m.ins if x[0] & 0xffff == OP_FUNCTION]:
+        a, e = m.function_range(fid)
+        out = []
+        for x in m.ins[a:e + 1]:
+            op = x[0] & 0xffff
+            if op not in (OP_FUNCTION, 55, OP_LABEL, OP_VARIABLE) and not rkeys.isdisjoint(x[1:]):
+                did = defined_id(x)
+                pos = [p for p in id_positions(x) if x[p] in ren and x[p] != did]
+                if pos:
+                    x = list(x)
+                    for p in pos: x[p] = ren[x[p]]
+            out.append(x)
+            did = defined_id(x)
+            if did in scale_at:
+                out.append([5 << 16 | OP_FMUL, f32, ren[did], did, fconsts[scale_at[did]]])
+        m.ins[a:e + 1] = out
+    return len(scale_at)
+
+
+def oot_fade3(m):
+    """Apply Block 1's screen-size fade formula to Block 3 (cp_s10 emission) in OoT foliage shader e855420a39e60874, using Block 3's own per-instance dist^2 and
+    diameter (2*r), c3[11].x, and this lane's dither/density bounds. Locates all anchors structurally; returns True if applied, False if pattern not found."""
+    def _miss(why):
+        print(f'oot_fade3: {why}', flush=True)
+        return False
+    f32 = m.find_type(OP_TYPE_FLOAT, 32)
+    i32 = m.find_type(OP_TYPE_INT, 32, 1)
+    b_t = m.find_type(OP_TYPE_BOOL)
+    if f32 is None or i32 is None or b_t is None: return _miss('types')
+    glsl = next((x[1] for x in m.ins if x[0] & 0xffff == OP_EXT_INST_IMPORT and string_at(x, 2)[0] == 'GLSL.std.450'), None)
+    if glsl is None: return _miss('glsl')
+    cp_c0 = next((vid for vid, (_, sc) in m.vars.items() if sc == SC_UNIFORM and re.fullmatch(r'(?:[a-z]+_)?c0', m.names.get(vid, ''))), None)
+    cp_c3 = next((vid for vid, (_, sc) in m.vars.items() if sc == SC_UNIFORM and re.fullmatch(r'(?:[a-z]+_)?c3', m.names.get(vid, ''))), None)
+    if cp_c0 is None or cp_c3 is None: return _miss('c0/c3')
+
+    def _fconst(target, tol):
+        for cid, (ty, words) in m.consts.items():
+            if ty == f32 and len(words) == 1:
+                v = struct.unpack('<f', struct.pack('<I', words[0]))[0]
+                if abs(v - target) < tol: return cid
+        return None
+
+    c_1_0101 = _fconst(1.01010096, 1e-5)
+    c_294545 = _fconst(294545.469, 1e-1)
+    c_0_5 = _fconst(0.5, 1e-6)
+    if c_1_0101 is None or c_294545 is None or c_0_5 is None: return _miss('consts')
+
+    entry = m.entry_function()
+    if entry is None: return _miss('entry')
+    fa, fe = m.function_range(entry)
+    ins = m.ins[fa:fe + 1]
+    def_at = {}
+    for idx, x in enumerate(ins):
+        op = x[0] & 0xffff
+        if op in (OP_LOAD, OP_SELECT, OP_FMUL, OP_EXT_INST, OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN, OP_COPY_OBJECT, OP_BITCAST):
+            def_at[x[2]] = idx
+
+    # 1. Locate Block 1's fade_screen -> byte0_norm and var_byte1 (also verify cp_c3[0][11][0] exists)
+    has_c3_11 = any((x[0] & 0xffff) in (OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN) and len(x) == 7 and x[3] == cp_c3
+                    and [const_int(m, i) for i in x[4:]] == [0, 11, 0] for x in ins)
+    if not has_c3_11: return _miss('c3_11')
+    fma_fade = [idx for idx, x in enumerate(ins)
+                if (x[0] & 0xffff) == OP_EXT_INST and x[3] == glsl and x[4] == GLSL_FMA and len(x) == 8 and x[7] == c_1_0101]
+    if len(fma_fade) != 1: return _miss(f'fma_fade {len(fma_fade)}')
+    def _aliases(val, start, end):
+        s = {val}
+        v = {x[1] for x in ins[start:end] if (x[0] & 0xffff) == OP_STORE and x[2] == val}
+        if v: s |= {x[2] for x in ins[start:end] if (x[0] & 0xffff) == OP_LOAD and x[3] in v}
+        return s
+
+    fma_vals = _aliases(ins[fma_fade[0]][2], fma_fade[0], min(len(ins), fma_fade[0] + 20))
+    clamp_ids = [x[2] for x in ins[fma_fade[0]:fma_fade[0] + 20]
+                 if (x[0] & 0xffff) == OP_EXT_INST and x[3] == glsl and x[4] in (43, 81) and x[5] in fma_vals]
+    if len(clamp_ids) != 1: return _miss('clamp')
+    fade_vals = _aliases(clamp_ids[0], fma_fade[0], min(len(ins), fma_fade[0] + 120))
+    nmax_ins = [x for x in ins[fma_fade[0]:fma_fade[0] + 120]
+                if (x[0] & 0xffff) == OP_EXT_INST and x[3] == glsl and x[4] in (40, 80) and (x[5] in fade_vals or x[6] in fade_vals)]
+    if len(nmax_ins) != 1: return _miss(f'nmax {len(nmax_ins)}')
+    byte0_norm = nmax_ins[0][5] if nmax_ins[0][6] in fade_vals else nmax_ins[0][6]
+    if byte0_norm not in def_at: return _miss('b0_def')
+    nmax_id = nmax_ins[0][2]
+    nmax_stores = [x[1] for x in ins[fma_fade[0]:fma_fade[0] + 80] if (x[0] & 0xffff) == OP_STORE and x[2] == nmax_id]
+    if not nmax_stores: return _miss('nmax_store')
+    var_nmax = nmax_stores[0]
+
+    def _trace_load(val, stop_var=None, depth=0):
+        if depth > 8 or val not in def_at: return None
+        idx = def_at[val]
+        x = ins[idx]
+        op = x[0] & 0xffff
+        if op == OP_LOAD:
+            v = x[3]
+            if v == stop_var: return v
+            for j in range(idx - 1, max(-1, idx - 25), -1):
+                if (ins[j][0] & 0xffff) == OP_STORE and ins[j][1] == v:
+                    return _trace_load(ins[j][2], stop_var, depth + 1)
+            return v
+        if op == OP_SELECT: return _trace_load(x[5], stop_var, depth + 1) or _trace_load(x[4], stop_var, depth + 1)
+        return None
+
+    var_byte1 = None
+    for idx in range(fma_fade[0], min(len(ins), fma_fade[0] + 400)):
+        x = ins[idx]
+        if (x[0] & 0xffff) == OP_FORD_LESS_EQUAL and _trace_load(x[3], var_nmax) == var_nmax:
+            var_byte1 = _trace_load(x[4])
+            break
+    if var_byte1 is None: return _miss('var_byte1')
+
+    # 2. Locate Block 3's cp_s10 emission block (first cp_c0[0][53][0] access) and its preceding gate
+    emit_ac = next((idx for idx, x in enumerate(ins)
+                    if (x[0] & 0xffff) in (OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN) and len(x) == 7 and x[3] == cp_c0
+                    and [const_int(m, i) for i in x[4:]] == [0, 53, 0]), None)
+    if emit_ac is None: return _miss('emit_ac')
+    lbl_emit_idx = next((idx for idx in range(emit_ac, -1, -1) if (ins[idx][0] & 0xffff) == OP_LABEL), None)
+    if lbl_emit_idx is None: return _miss('lbl_emit')
+    lbl_emit = ins[lbl_emit_idx][1]
+    if not any((x[0] & 0xffff) == 339 for x in ins[lbl_emit_idx:emit_ac]): return _miss('ballot')   # OpGroupNonUniformBallot
+
+    # Gate block ends with OpSelectionMerge %lbl_emit None; OpBranchConditional %soft_cond %lbl_ret_check %lbl_emit
+    if lbl_emit_idx < 10: return _miss('lbl_emit_idx')
+    # Check %lbl_ret_check -> %lbl_ret: OpReturn immediately precedes %lbl_emit_idx
+    br_gate_idx = next((idx for idx in range(lbl_emit_idx - 1, max(0, lbl_emit_idx - 25), -1)
+                        if (ins[idx][0] & 0xffff) == OP_BRANCH_CONDITIONAL and ins[idx][3] == lbl_emit
+                        and idx > 0 and (ins[idx - 1][0] & 0xffff) == OP_SELECTION_MERGE and ins[idx - 1][1] == lbl_emit), None)
+    if br_gate_idx is None: return _miss('br_gate')
+    soft_cond = ins[br_gate_idx][1]
+    lbl_ret_check = ins[br_gate_idx][2]
+    if (ins[br_gate_idx + 1][0] & 0xffff) != OP_LABEL or ins[br_gate_idx + 1][1] != lbl_ret_check: return _miss('lbl_ret_check')
+    # Verify %lbl_ret_check loads %var_mask, does OpNot, OpINotEqual 0, branches to OpReturn
+    ret_check_ins = ins[br_gate_idx + 2:lbl_emit_idx]
+    load_mask = next((x for x in ret_check_ins if (x[0] & 0xffff) == OP_LOAD and x[1] == i32), None)
+    if load_mask is None or not any((x[0] & 0xffff) == OP_RETURN for x in ret_check_ins): return _miss('ret_check')
+    var_mask = load_mask[3]
+    lbl_gate_idx = next((idx for idx in range(br_gate_idx, -1, -1) if (ins[idx][0] & 0xffff) == OP_LABEL), None)
+    if lbl_gate_idx is None: return _miss('lbl_gate')
+    store_mask_idx = next((idx for idx in range(br_gate_idx - 1, lbl_gate_idx, -1)
+                           if (ins[idx][0] & 0xffff) == OP_STORE and ins[idx][1] == var_mask), None)
+    if store_mask_idx is None: return _miss('store_mask')
+    mask_val = ins[store_mask_idx][2]
+
+    # 3. Locate Block 3's diameter var (2*r: OpFMul(OpLoad var_diam, 0.5) in frustum test before lbl_gate) and dist^2 var (Fma -> Store before InverseSqrt)
+    var_diam = None
+    for idx in range(lbl_gate_idx - 1, max(0, lbl_gate_idx - 350), -1):
+        x = ins[idx]
+        if (x[0] & 0xffff) == OP_FMUL and x[1] == f32 and c_0_5 in x[3:5]:
+            other = x[3] if x[4] == c_0_5 else x[4]
+            if other in def_at and (ins[def_at[other]][0] & 0xffff) == OP_LOAD:
+                var_diam = ins[def_at[other]][3]
+                diam_mul_idx = idx
+                break
+    if var_diam is None: return _miss('var_diam')
+
+    var_dist_sq = None
+    for idx in range(diam_mul_idx - 1, max(0, diam_mul_idx - 400), -1):
+        x = ins[idx]
+        if (x[0] & 0xffff) in (OP_ACCESS_CHAIN, OP_IN_BOUNDS_ACCESS_CHAIN) and len(x) == 7 and x[3] == cp_c3 and [const_int(m, i) for i in x[4:]] == [0, 4, 2]:
+            for j in range(idx + 1, min(diam_mul_idx, idx + 80)):
+                y = ins[j]
+                if (y[0] & 0xffff) == OP_EXT_INST and y[3] == glsl and y[4] == 32:   # InverseSqrt of dist^2
+                    dsq_id = y[5]
+                    if dsq_id in def_at and (ins[def_at[dsq_id]][0] & 0xffff) == OP_LOAD:
+                        var_dist_sq = ins[def_at[dsq_id]][3]
+                        break
+                    for k in range(max(idx, j - 12), j):
+                        if (ins[k][0] & 0xffff) == OP_STORE and ins[k][2] == dsq_id:
+                            var_dist_sq = ins[k][1]
+                    if var_dist_sq is not None: break
+            if var_dist_sq is not None: break
+    if var_dist_sq is None: return _miss('var_dist_sq')
+
+    # 4. Build and insert the Block 3 fade test
+    c_0 = m.add_const(f32, 0)
+    c_1 = m.add_const(f32, 0x3f800000)
+    c_i0 = m.add_const(i32, 0)
+    c_i11 = m.add_const(i32, 11)
+    c_in1 = m.add_const(i32, 0xffffffff)
+    ptr_f_fn = m.add_type(OP_TYPE_POINTER, SC_FUNCTION, f32)
+    ptr_f_u = m.add_type(OP_TYPE_POINTER, SC_UNIFORM, f32)
+
+    var_b0 = m.new_id()
+    b0_def_idx = def_at[byte0_norm]
+
+    # New ids for Block 3 fade computation
+    ld_diam, diam_sq, ld_dsq = m.new_id(), m.new_id(), m.new_id()
+    ac_c3, ld_c3, c3_sq = m.new_id(), m.new_id(), m.new_id()
+    denom, num, ratio, neg_ratio, fade_raw, fade_3 = m.new_id(), m.new_id(), m.new_id(), m.new_id(), m.new_id(), m.new_id()
+    ld_b0, ld_b1, mval_3, not_faded, faded, fade_mask = m.new_id(), m.new_id(), m.new_id(), m.new_id(), m.new_id(), m.new_id()
+    new_mask, new_soft = m.new_id(), m.new_id()
+
+    fade_ins = [
+        [4 << 16 | OP_LOAD, f32, ld_diam, var_diam],
+        [5 << 16 | OP_FMUL, f32, diam_sq, ld_diam, ld_diam],
+        [4 << 16 | OP_LOAD, f32, ld_dsq, var_dist_sq],
+        [7 << 16 | OP_ACCESS_CHAIN, ptr_f_u, ac_c3, cp_c3, c_i0, c_i11, c_i0],
+        [4 << 16 | OP_LOAD, f32, ld_c3, ac_c3],
+        [5 << 16 | OP_FMUL, f32, c3_sq, ld_c3, ld_c3],
+        [5 << 16 | OP_FMUL, f32, denom, c3_sq, ld_dsq],
+        [5 << 16 | OP_FMUL, f32, num, c_294545, diam_sq],
+        [5 << 16 | 136, f32, ratio, num, denom],              # OpFDiv
+        [4 << 16 | 127, f32, neg_ratio, ratio],               # OpFNegate
+        [5 << 16 | OP_FADD, f32, fade_raw, neg_ratio, c_1_0101],
+        [8 << 16 | OP_EXT_INST, f32, fade_3, glsl, 81, fade_raw, c_0, c_1],   # NClamp
+        [4 << 16 | OP_LOAD, f32, ld_b0, var_b0],
+        [4 << 16 | OP_LOAD, f32, ld_b1, var_byte1],
+        [7 << 16 | OP_EXT_INST, f32, mval_3, glsl, 80, ld_b0, fade_3],        # NMax
+        [5 << 16 | 189, b_t, not_faded, mval_3, ld_b1],      # OpFUnordLessThanEqual
+        [4 << 16 | OP_LOGICAL_NOT, b_t, faded, not_faded],
+        [6 << 16 | OP_SELECT, i32, fade_mask, not_faded, c_in1, c_i0],
+        [5 << 16 | OP_BITWISE_AND, i32, new_mask, mask_val, fade_mask],
+    ]
+
+    # Insert in reverse index order within `ins` so earlier indices remain valid:
+    # 1) Update OpBranchConditional %soft_cond -> %new_soft and insert OpLogicalOr right before OpSelectionMerge
+    ins[br_gate_idx] = [4 << 16 | OP_BRANCH_CONDITIONAL, new_soft, lbl_ret_check, lbl_emit]
+    ins.insert(br_gate_idx - 1, [5 << 16 | OP_LOGICAL_OR, b_t, new_soft, soft_cond, faded])
+    # 2) Update OpStore %var_mask %new_mask and insert fade_ins right before it
+    ins[store_mask_idx] = [3 << 16 | OP_STORE, var_mask, new_mask]
+    ins[store_mask_idx:store_mask_idx] = fade_ins
+    # 3) Store byte0_norm into var_b0 right after byte0_norm is defined
+    ins.insert(b0_def_idx + 1, [3 << 16 | OP_STORE, var_b0, byte0_norm])
+    # 4) Declare var_b0 in entry function's first block (after OpLabel)
+    lbl0_idx = next(idx for idx, x in enumerate(ins) if (x[0] & 0xffff) == OP_LABEL)
+    ins.insert(lbl0_idx + 1, [4 << 16 | OP_VARIABLE, ptr_f_fn, var_b0, SC_FUNCTION])
+
+    m.ins[fa:fe + 1] = ins
+    return True
+
+
 

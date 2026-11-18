@@ -770,16 +770,78 @@ void vka_tex_gw_copy(uint64_t src, uint64_t dst, uint64_t n) { gw_add(GW_COPY, d
 void vka_tex_gw_fill(uint64_t dst, uint64_t n, uint32_t value) { gw_add(GW_FILL, dst, n, 0, value, NULL); }
 void vka_tex_gw_update(uint64_t dst, uint64_t n, const void *data) { gw_add(GW_UPDATE, dst, n, 0, 0, data); }
 void vka_tex_gw_opaque(uint64_t dst, uint64_t n) { gw_add(GW_OPAQUE, dst, n, 0, 0, NULL); }
+unsigned vka_tex_gw_probe(uint64_t addr, uint64_t length, uint64_t *flight_fence) {
+    if (flight_fence) *flight_fence = 0;
+    if (!length || addr > UINT64_MAX - length) return VKA_GW_INVALID_RANGE;
+    uint64_t done = vka_done(); unsigned flags = 0;
+    pthread_mutex_lock(&g_tmu);
+    int first = g_ngw > 2048 ? g_ngw - 2048 : 0;
+    if (first) flags |= VKA_GW_TRUNCATED;
+    for (int i = g_ngw - 1; i >= first; i--) {
+        const gw_t *write = &g_gw[i];
+        if (write->hi <= write->lo) { flags |= VKA_GW_INVALID_RANGE; continue; }
+        if (write->lo >= addr + length || write->hi <= addr) continue;
+        int opaque = write->kind == GW_OPAQUE;
+        if (!write->fence) flags |= opaque ? VKA_GW_CURRENT_OPAQUE : VKA_GW_CURRENT_KNOWN;
+        else if (write->fence > done) { flags |= opaque ? VKA_GW_FLIGHT_OPAQUE : VKA_GW_FLIGHT_KNOWN; if (flight_fence && write->fence > *flight_fence) *flight_fence = write->fence; }
+        else flags |= opaque ? VKA_GW_DONE_OPAQUE : VKA_GW_DONE_KNOWN;
+    }
+    pthread_mutex_unlock(&g_tmu);
+    return flags;
+}
 // Stores through raw global memory (an address the shader loaded: dmsh_abi.h DMSH_GMEM_LOG_*) land where only the GPU knows: each draw or dispatch with such stores gets a write
 // log of its own, read once its submission is done; its pages become writes of unknown bytes, done (the images over them are uploaded again)
 enum { GML_N = 256, GML_BYTES = (1 + (1 << DMSH_GMEM_LOG_LOG2)) * 4 };
-static struct { vka_span s; uint64_t fence; int used; } g_gml[GML_N]; static int g_gml_init; static uint64_t g_gml_pages, g_gml_full, g_gml_none;
-int vka_tex_gml_take(VkDescriptorBufferInfo *bi) {   // 0 = no log free (the caller binds an unread one)
+static struct { vka_span s; uint64_t fence, watch_key, watch_id; int used, watch_stage; } g_gml[GML_N]; static int g_gml_init; static uint64_t g_gml_pages, g_gml_full, g_gml_none;
+static uint32_t g_gml_watch_page; static int g_gml_watch_initialized; static uint64_t g_gml_watch_next, g_gml_watch_polled, g_gml_watch_hits, g_gml_watch_lost;
+static void gml_watch_init(void) {
+    char value[64], *end; if (!vka_env_str("DM_VK_GML_WATCH_PAGE", value, sizeof value)) return;
+    size_t len = strlen(value); const char *digits = value;
+    if (len >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) digits += 2;
+    int valid = *digits != 0 && len <= 18;
+    for (const char *p = digits; *p; p++) if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) valid = 0;
+    errno = 0; unsigned long long addr = strtoull(value, &end, 16);
+    if (!valid || errno || end == value || *end || !addr || (addr & 4095) || (addr >> 12) > UINT32_MAX) {
+        VLOG("TEMP raw-global page watch: invalid address; disabled"); return;
+    }
+    g_gml_watch_page = (uint32_t)(addr >> 12);
+    VLOG("TEMP raw-global page watch: page=%#llx; page hit is not an exact write", addr);
+}
+static void gml_watch_ensure(void) { if (!g_gml_watch_initialized) { g_gml_watch_initialized = 1; gml_watch_init(); } }
+void vka_tex_gw_watch_binding(uint64_t addr, uint64_t length, uint64_t key, int stage, uint32_t binding) {
+    static uint64_t scanned, hits;
+    pthread_mutex_lock(&g_tmu); gml_watch_ensure();
+    if (g_gml_watch_page) {
+        uint64_t target = (uint64_t)g_gml_watch_page << 12; uint64_t count = ++scanned;
+        if (length && (addr <= target ? target - addr < length : addr - target < 8)) {
+            uint64_t hit = ++hits;
+            if (hit <= 128 || !(hit & (hit - 1))) VLOG("TEMP mesh binding overlap=%llu scan=%llu key=%016llx stage=%d binding=%u addr=%#llx length=%#llx descriptor_only=1 execution_and_write_unverified=1", (unsigned long long)hit, (unsigned long long)count, (unsigned long long)key, stage, binding, (unsigned long long)addr, (unsigned long long)length);
+        }
+        if (!(count & (count - 1))) VLOG("TEMP mesh binding coverage: scanned=%llu overlaps=%llu descriptor_only=1", (unsigned long long)count, (unsigned long long)hits);
+    }
+    pthread_mutex_unlock(&g_tmu);
+}
+void vka_tex_gw_watch_transfer(const char *kind, uint64_t dst, uint64_t length, uint64_t src) {
+    static uint64_t scanned, hits;
+    pthread_mutex_lock(&g_tmu); gml_watch_ensure();
+    if (g_gml_watch_page) {
+        uint64_t target = (uint64_t)g_gml_watch_page << 12; uint64_t count = ++scanned;
+        if (length && (dst <= target ? target - dst < length : dst - target < 8)) {
+            uint64_t hit = ++hits;
+            if (hit <= 128 || !(hit & (hit - 1))) VLOG("TEMP mesh transfer overlap=%llu scan=%llu kind=%s dst=%#llx length=%#llx src=%#llx attempted_only=1 execution_unverified=1 texture_padding_possible=%u", (unsigned long long)hit, (unsigned long long)count, kind, (unsigned long long)dst, (unsigned long long)length, (unsigned long long)src, !strcmp(kind, "texture_to_buffer"));
+        }
+        if (!(count & (count - 1))) VLOG("TEMP mesh transfer coverage: scanned=%llu overlaps=%llu attempted_only=1", (unsigned long long)count, (unsigned long long)hits);
+    }
+    pthread_mutex_unlock(&g_tmu);
+}
+int vka_tex_gml_take(VkDescriptorBufferInfo *bi, uint64_t key, int stage) {   // 0 = no log free (the caller binds an unread one)
     pthread_mutex_lock(&g_tmu);
-    if (!g_gml_init) { g_gml_init = 1; for (int i = 0; i < GML_N; i++) if (!vka_static(GML_BYTES, V.sb_align, &g_gml[i].s)) break; }
+    if (!g_gml_init) { g_gml_init = 1; gml_watch_ensure(); for (int i = 0; i < GML_N; i++) if (!vka_static(GML_BYTES, V.sb_align, &g_gml[i].s)) break; }
     for (int i = 0; i < GML_N; i++) if (!g_gml[i].used && g_gml[i].s.ptr) {
         g_gml[i].used = 1; g_gml[i].fence = 0; memset(g_gml[i].s.ptr, 0, GML_BYTES);
+        if (g_gml_watch_page) { g_gml[i].watch_id = ++g_gml_watch_next; g_gml[i].watch_key = key; g_gml[i].watch_stage = stage; }
         *bi = (VkDescriptorBufferInfo){g_gml[i].s.buf, g_gml[i].s.off, GML_BYTES}; pthread_mutex_unlock(&g_tmu); return 1; }
+    if (g_gml_watch_page && ++g_gml_watch_lost <= 4) VLOG("TEMP raw-global page watch: slot unavailable; coverage incomplete lost=%llu", (unsigned long long)g_gml_watch_lost);
     g_gml_none++; pthread_mutex_unlock(&g_tmu);
     VRED_ONCE("more than %d raw global memory write logs in flight: stores of later draws are not followed into textures", GML_N);
     return 0;
@@ -789,11 +851,20 @@ static void gml_poll(void) {   // caller holds g_tmu
     uint64_t done = vka_done();
     for (int i = 0; i < GML_N; i++) {
         if (!g_gml[i].used || !g_gml[i].fence || g_gml[i].fence > done) continue;
-        const uint32_t *w = (const uint32_t *)g_gml[i].s.ptr; g_gml_full += w[0] != 0;
-        if (w[0]) VRED_ONCE("a raw global memory write log ran out of slots: some stores are not followed into textures");
-        for (int k = 1; k <= 1 << DMSH_GMEM_LOG_LOG2; k++) if (w[k]) {
+        const uint32_t *w = (const uint32_t *)g_gml[i].s.ptr; uint32_t overflow = w[0]; g_gml_full += overflow != 0;
+        if (overflow) VRED_ONCE("a raw global memory write log ran out of slots: some stores are not followed into textures");
+        if (g_gml_watch_page && overflow && !vka_hung() && g_gml_watch_lost++ < 4) VLOG("TEMP raw-global page watch: log overflow; coverage incomplete");
+        for (int k = 1; k <= 1 << DMSH_GMEM_LOG_LOG2; k++) { uint32_t page = w[k]; if (page) {
             if (g_ngw == g_gwcap) { g_gwcap = g_gwcap ? 2 * g_gwcap : 256; g_gw = realloc(g_gw, (size_t)g_gwcap * sizeof *g_gw); }
-            uint64_t a = (uint64_t)w[k] << 12; g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, g_gml[i].fence, GW_OPAQUE, 0, NULL}; g_gml_pages++;
+            uint64_t a = (uint64_t)page << 12; g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, g_gml[i].fence, GW_OPAQUE, 0, NULL}; g_gml_pages++;
+            if (g_gml_watch_page && page == g_gml_watch_page && !vka_hung()) {
+                uint64_t hit = ++g_gml_watch_hits;
+                if (hit <= 128 || !(hit & (hit - 1))) VLOG("TEMP raw-global page hit=%llu slot_id=%llu fence=%llu key=%016llx stage=%d overflow=%u page_only=1 completion_unverified=1", (unsigned long long)hit, (unsigned long long)g_gml[i].watch_id, (unsigned long long)g_gml[i].fence, (unsigned long long)g_gml[i].watch_key, g_gml[i].watch_stage, overflow != 0);
+            }
+        } }
+        if (g_gml_watch_page && !vka_hung()) {
+            uint64_t polled = ++g_gml_watch_polled;
+            if (!(polled & (polled - 1))) VLOG("TEMP raw-global page coverage: allocated=%llu polled=%llu hits=%llu lost_or_overflow=%llu completion_unverified=1", (unsigned long long)g_gml_watch_next, (unsigned long long)polled, (unsigned long long)g_gml_watch_hits, (unsigned long long)g_gml_watch_lost);
         }
         g_gml[i].used = 0;
     }

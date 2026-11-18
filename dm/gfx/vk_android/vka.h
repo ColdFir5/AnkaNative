@@ -45,7 +45,9 @@
     X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants) X(vkCmdSetLineWidth) \
-    X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT)
+    X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) \
+    X(vkGetPipelineExecutablePropertiesKHR) X(vkGetPipelineExecutableStatisticsKHR)
+#define VKA_MESH_NV_STRIDE 0x494d564eu   // vkCmdDrawMeshTasksIndirectEXT stride for NVN's {count, first} records (V.mesh_nv_ind; our Turnip's tu_mesh.h)
 #define VKA_DECL(f) PFN_##f f;
 typedef struct { PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr; VKA_GLOBAL_FNS(VKA_DECL) VKA_INSTANCE_FNS(VKA_DECL) VKA_DEVICE_FNS(VKA_DECL) } vka_fns;
 extern vka_fns vk;   // a missing optional entry point is NULL
@@ -89,7 +91,7 @@ typedef struct {
     // NVN2 task and mesh programs (VK_EXT_mesh_shader: mesh = meshShader, task = taskShader too; DM_VK_MESH=0 leaves it off): their shaders are refused without it (vka_shader.c refusal)
     // and their draws skipped. mesh_inv / task_inv: the largest workgroup (maxMeshWorkGroupInvocations / maxTaskWorkGroupInvocations); mesh_out_v / mesh_out_p: the most vertices /
     // primitives a mesh workgroup may output; task_payload: maxTaskPayloadSize; task_groups / mesh_groups: maxTaskWorkGroupCount[0] / maxMeshWorkGroupCount[0] (a draw's count)
-    int mesh, task; uint32_t mesh_inv, task_inv, mesh_out_v, mesh_out_p, task_payload, task_groups, mesh_groups;
+    int mesh, task, mesh_nv_ind; uint32_t mesh_inv, task_inv, mesh_out_v, mesh_out_p, task_payload, task_groups, mesh_groups;
     int gpl;                                        // graphics pipeline libraries with fast linking (VK_EXT_graphics_pipeline_library): a pipeline the cache lacks is linked from stage libraries at once, the optimized one made in the background (vka_pso.c)
     uint32_t max_push, max_vin_bindings, subgroup_size, subgroup_min, subgroup_max, subgroup_stages;   // subgroup_stages: VkShaderStageFlags with subgroup operations
     uint32_t subgroup_req_stages;                   // VkShaderStageFlags a pipeline may pin the subgroup size in (requiredSubgroupSizeStages; 0 without subgroupSizeControl)
@@ -104,8 +106,10 @@ typedef struct {
     int sparse_res;                                 // sparse residency images can be made (vka_sparse.c): binding on the queue, 2D residency, standard block shape, strict non-resident reads
     int sparse_buf;                                 // sparse residency buffers can be made (vka_mem.c span buffers): binding on the queue, buffer residency, strict non-resident reads
     uint64_t tl_queued;                             // the highest timeline value a vkQueueSubmit so far signals (under qmu): what a later submission on the queue may wait for
+    int tmp_pipe_stats;                             // TEMP: DM_TMP_PIPE_STATS (VK_KHR_pipeline_executable_properties)
 } vka_dev;
 extern vka_dev V;
+int tmp_pipe_stats_has(uint64_t key);
 // Custom GPU drivers (vka_driver.c): DM_VK_DRIVER=<folder with meta.json, or a .so> loads that driver through libadrenotools (restart only); unset, empty or "system" = the
 // system libvulkan.so. vka_driver_open returns the libvulkan handle (NULL = use the system one); vka_driver_tag is a file-name-safe name of the custom driver in use, NULL for the system's
 void *vka_driver_open(void);
@@ -123,6 +127,8 @@ uint64_t vka_fence_queued(void);                    // the last fence handed to 
 void vka_rp_sub_begin(void);
 void vka_rp_exec(const uint8_t *handle, uint64_t fence);   // fence: the submission's, reserved before it (0 = taken at its commit)
 uint64_t vka_rp_sub_commit(uint64_t reserved);
+uint64_t vka_exec_submission_frame(void);
+void vka_mesh_gpu_probe_commit(uint64_t fence, int success);
 void vka_rp_queue_activate(uint64_t serial);
 void vka_rp_queue_forget(uint64_t serial);
 void vka_rp_set_queue_origin(int on);
@@ -349,7 +355,7 @@ void vka_gp_draw(VkCommandBuffer cb, VkPipeline pipe, uint64_t vs, uint64_t fs, 
 void vka_gp_rp_end(VkCommandBuffer cb);
 void vka_img_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to);
 // The control line "screenshot" (vka_ctl.c): the present copies the window texture's crop into its command buffer, then hands the texels to the PNG writer once that submission is done
-void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch);
+void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch, uint64_t ticket, uint64_t present_serial);
 void vka_ctl_shot_done(VkFence fence);
 int vka_ctl_bufshot_want(unsigned long long index, int *slot);   // the ctl bufshot: 1 = the dispatch of this index in the frame is asked for (its slot in *slot)
 void vka_ctl_bufshot_record(VkCommandBuffer cb, uint64_t key, uint64_t addr, VkBuffer src, VkDeviceSize off, VkDeviceSize n);   // after that dispatch's barrier
@@ -443,6 +449,12 @@ void vka_dstate_reset(vka_dstate *d);
 int vka_state_op(vka_dstate *d, uint32_t op, const void *a);   // 1 = a state record, taken
 // The render pass the draws of a submission go into: opened at a draw, closed by anything that is not a draw or state (vka_rp_end), and by a new SET_RT
 void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot);    // the slot's per-draw descriptor sets are free again (its last fence is done)
+void vka_draw_mesh_indirect_diag_control(int enabled);
+void vka_draw_mesh_indirect_diag_frame(void);
+void vka_draw_mesh_indirect_diag_submission(uint64_t frame);
+void vka_draw_mesh_indirect_diag_flush(void);
+void vka_mesh_arg_probe_visit(const uint8_t *record, const p_draw *draw);
+void vka_mesh_arg_probe_read(uint64_t addr, int readable, const uint32_t words[2], uint64_t mesh_key);
 void vka_rp_end(void);
 int vka_rp_split_ok(const p_set_rt *rt, int has_rt);
 void vka_draw_cb_switch(VkCommandBuffer cb);
@@ -491,7 +503,11 @@ void vka_tex_gw_copy(uint64_t src, uint64_t dst, uint64_t n);
 void vka_tex_gw_fill(uint64_t dst, uint64_t n, uint32_t value);
 void vka_tex_gw_update(uint64_t dst, uint64_t n, const void *data);
 void vka_tex_gw_opaque(uint64_t dst, uint64_t n);   // bytes the host does not know at recording (shader stores, texture → buffer copies)
-int vka_tex_gml_take(VkDescriptorBufferInfo *bi);  // a raw global memory write log for one draw or dispatch, read when its submission is done (0 = none free)
+void vka_tex_gw_watch_binding(uint64_t addr, uint64_t length, uint64_t key, int stage, uint32_t binding);
+void vka_tex_gw_watch_transfer(const char *kind, uint64_t dst, uint64_t length, uint64_t src);
+enum { VKA_GW_CURRENT_KNOWN = 1, VKA_GW_CURRENT_OPAQUE = 2, VKA_GW_FLIGHT_KNOWN = 4, VKA_GW_FLIGHT_OPAQUE = 8, VKA_GW_DONE_KNOWN = 16, VKA_GW_DONE_OPAQUE = 32, VKA_GW_TRUNCATED = 64, VKA_GW_INVALID_RANGE = 128 };
+unsigned vka_tex_gw_probe(uint64_t addr, uint64_t length, uint64_t *flight_fence);
+int vka_tex_gml_take(VkDescriptorBufferInfo *bi, uint64_t key, int stage);  // a raw global memory write log for one draw or dispatch, read when its submission is done (0 = none free)
 void vka_tex_gw_commit(uint64_t fence);
 void vka_tex_watch_dispatch(uint64_t key);         // DM_VK_NANSCAN: compute shaders by submission, for the storage watch             // the writes recorded since the last commit belong to this submission
 void vka_nan_draw(uint64_t vs, uint64_t fs);

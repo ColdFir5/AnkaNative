@@ -486,6 +486,322 @@ static int cpu_read(uint64_t addr, void *out, size_t n) {   // guest bytes as th
     if (vka_addr(addr, n, NULL, NULL, NULL)) { memcpy(out, (const void *)(uintptr_t)addr, n); return 1; }
     return !plat_mem_read(addr, out, n);
 }
+enum { MESH_GPU_PROBE_MAX = 128 };
+typedef struct { uint64_t addr, key, frame, visit, fence; uint32_t cpu[2], index, phase, mode; int invalid, cpu_valid; } mesh_gpu_sample;
+static pthread_mutex_t g_mesh_gpu_probe_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    VkBuffer buffer; VkDeviceMemory memory; uint32_t *mapped;
+    mesh_gpu_sample samples[MESH_GPU_PROBE_MAX];
+    uint64_t visits, valid_through; unsigned attempts, count, pending; int initialized, cap_logged, failed;
+} g_mesh_gpu_probe;
+static const uint64_t g_mesh_corr_draw_key = 0x25c4a740753e7d7aull;
+static const uint64_t g_mesh_corr_dispatch_key[2] = {0x510c344f1b4e4e55ull, 0xa22751e0034b3981ull};
+static struct {
+    uint64_t addr, origin_frame, visit, events;
+    unsigned every;
+    int initialized, configured, stopped, cap_logged;
+    struct {
+        uint64_t frame, draw_candidates, draw_samples;
+        uint64_t dispatch_candidates[2], dispatch_pairs[2], drops;
+        uint64_t first_sample, last_sample;
+        int active, selected;
+    } frame;
+} g_mesh_corr;
+static int mesh_gpu_probe_init(void) {
+    if (g_mesh_gpu_probe.initialized) return g_mesh_gpu_probe.mapped != NULL;
+    g_mesh_gpu_probe.initialized = 1;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MESH_GPU_PROBE_MAX * 8, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkMemoryRequirements mr; uint32_t type = UINT32_MAX;
+    if (!vk.vkCreateBuffer(V.dev, &bi, NULL, &g_mesh_gpu_probe.buffer)) {
+        vk.vkGetBufferMemoryRequirements(V.dev, g_mesh_gpu_probe.buffer, &mr);
+        type = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    }
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = type == UINT32_MAX ? 0 : mr.size, .memoryTypeIndex = type};
+    void *mapped = NULL;
+    if (!g_mesh_gpu_probe.buffer || type == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_mesh_gpu_probe.memory) ||
+        vk.vkBindBufferMemory(V.dev, g_mesh_gpu_probe.buffer, g_mesh_gpu_probe.memory, 0) ||
+        vk.vkMapMemory(V.dev, g_mesh_gpu_probe.memory, 0, VK_WHOLE_SIZE, 0, &mapped)) {
+        if (g_mesh_gpu_probe.buffer) vk.vkDestroyBuffer(V.dev, g_mesh_gpu_probe.buffer, NULL);
+        if (g_mesh_gpu_probe.memory) vk.vkFreeMemory(V.dev, g_mesh_gpu_probe.memory, NULL);
+        g_mesh_gpu_probe.buffer = VK_NULL_HANDLE; g_mesh_gpu_probe.memory = VK_NULL_HANDLE;
+        VLOG("TEMP mesh GPU copy: allocation failed; diagnostic disabled"); return 0;
+    }
+    g_mesh_gpu_probe.mapped = mapped; return 1;
+}
+static int mesh_corr_config(void) {
+    if (g_mesh_corr.initialized) return g_mesh_corr.configured;
+    g_mesh_corr.initialized = 1; g_mesh_corr.origin_frame = UINT64_MAX;
+    const char *value = getenv("DM_VK_GML_WATCH_PAGE"), *digits = value;
+    char *end = NULL; errno = 0;
+    if (digits && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) digits += 2;
+    unsigned long long addr = digits && *digits && *digits != '-' ? strtoull(digits, &end, 16) : 0;
+    if (!digits || !*digits || !end || *end || errno || !addr || addr > UINT64_MAX - 8) {
+        VLOG("TEMP mesh correlation disabled: DM_VK_GML_WATCH_PAGE is missing or invalid"); g_mesh_corr.stopped = 1; return 0;
+    }
+    int every = VKA_ENV("DM_VK_MESH_GPU_COPY_FRAME_EVERY", 1);
+    if (every < 1) every = 1; if (every > 4096) every = 4096;
+    g_mesh_corr.addr = addr; g_mesh_corr.every = (unsigned)every; g_mesh_corr.configured = 1;
+    VLOG("TEMP mesh correlation mode=4 target=%#llx frame_every=%u scope=same-frame-only-not-causation-or-display draw_key=%016llx dispatch_keys=%016llx,%016llx",
+         addr, g_mesh_corr.every, (unsigned long long)g_mesh_corr_draw_key,
+         (unsigned long long)g_mesh_corr_dispatch_key[0], (unsigned long long)g_mesh_corr_dispatch_key[1]);
+    return 1;
+}
+static void mesh_corr_flush_frame(void) {
+    if (!g_mesh_corr.frame.active) return;
+    VLOG("TEMP mesh correlation coverage frame=%llu origin=%llu selected=%d target=%#llx draw_copy_slots_queued=%llu/%llu dispatch_%016llx_pairs_queued=%llu/%llu dispatch_%016llx_pairs_queued=%llu/%llu drops=%llu sample_range_valid=%d first_sample=%llu last_sample=%llu",
+         (unsigned long long)g_mesh_corr.frame.frame, (unsigned long long)g_mesh_corr.origin_frame, g_mesh_corr.frame.selected, (unsigned long long)g_mesh_corr.addr,
+         (unsigned long long)g_mesh_corr.frame.draw_samples, (unsigned long long)g_mesh_corr.frame.draw_candidates,
+         (unsigned long long)g_mesh_corr_dispatch_key[0], (unsigned long long)g_mesh_corr.frame.dispatch_pairs[0], (unsigned long long)g_mesh_corr.frame.dispatch_candidates[0],
+         (unsigned long long)g_mesh_corr_dispatch_key[1], (unsigned long long)g_mesh_corr.frame.dispatch_pairs[1], (unsigned long long)g_mesh_corr.frame.dispatch_candidates[1],
+         (unsigned long long)g_mesh_corr.frame.drops,
+         g_mesh_corr.frame.first_sample != UINT64_MAX, (unsigned long long)(g_mesh_corr.frame.first_sample == UINT64_MAX ? 0 : g_mesh_corr.frame.first_sample),
+         (unsigned long long)g_mesh_corr.frame.last_sample);
+    memset(&g_mesh_corr.frame, 0, sizeof g_mesh_corr.frame);
+}
+static void mesh_corr_enter_frame(uint64_t frame) {
+    if (g_mesh_corr.frame.active && g_mesh_corr.frame.frame != frame) mesh_corr_flush_frame();
+    if (g_mesh_corr.origin_frame == UINT64_MAX) g_mesh_corr.origin_frame = frame;
+    if (!g_mesh_corr.frame.active) {
+        g_mesh_corr.frame.active = 1; g_mesh_corr.frame.frame = frame;
+        g_mesh_corr.frame.selected = frame >= g_mesh_corr.origin_frame && (frame - g_mesh_corr.origin_frame) % g_mesh_corr.every == 0;
+        g_mesh_corr.frame.first_sample = UINT64_MAX;
+    }
+}
+static int mesh_corr_event(uint64_t frame, uint64_t key, int draw, uint64_t *visit) {
+    if (!mesh_corr_config() || g_mesh_corr.stopped) return 0;
+    mesh_corr_enter_frame(frame);
+    if (g_mesh_corr.events >= MESH_GPU_PROBE_MAX) {
+        if (!g_mesh_corr.cap_logged) { g_mesh_corr.cap_logged = 1; g_mesh_corr.stopped = 1; VLOG("TEMP mesh correlation stopped: eligible-operation cap=%u", MESH_GPU_PROBE_MAX); mesh_corr_flush_frame(); }
+        return 0;
+    }
+    *visit = ++g_mesh_corr.visit; g_mesh_corr.events++;
+    if (draw) g_mesh_corr.frame.draw_candidates++;
+    else if (key == g_mesh_corr_dispatch_key[0]) g_mesh_corr.frame.dispatch_candidates[0]++;
+    else if (key == g_mesh_corr_dispatch_key[1]) g_mesh_corr.frame.dispatch_candidates[1]++;
+    return g_mesh_corr.frame.selected;
+}
+static void mesh_corr_drop(uint64_t frame, uint64_t visit, uint64_t key, const char *kind, const char *reason) {
+    if (g_mesh_corr.frame.active && g_mesh_corr.frame.frame == frame) g_mesh_corr.frame.drops++;
+    VLOG("TEMP mesh correlation drop frame=%llu visit=%llu key=%016llx addr=%#llx kind=%s reason=%s", (unsigned long long)frame,
+         (unsigned long long)visit, (unsigned long long)key, (unsigned long long)g_mesh_corr.addr, kind, reason);
+}
+static void mesh_corr_sampled(uint64_t frame, int draw, int which, unsigned index, unsigned slots) {
+    if (!g_mesh_corr.frame.active || g_mesh_corr.frame.frame != frame) return;
+    if (draw) g_mesh_corr.frame.draw_samples++;
+    else g_mesh_corr.frame.dispatch_pairs[which]++;
+    if (g_mesh_corr.frame.first_sample == UINT64_MAX) g_mesh_corr.frame.first_sample = index;
+    g_mesh_corr.frame.last_sample = index + slots - 1;
+}
+static void mesh_corr_stop(const char *reason) {
+    if (g_mesh_corr.stopped) return;
+    g_mesh_corr.stopped = 1;
+    VLOG("TEMP mesh correlation stopped: %s; samples=%u/%u operations=%llu/%u", reason, g_mesh_gpu_probe.count, MESH_GPU_PROBE_MAX,
+         (unsigned long long)g_mesh_corr.events, MESH_GPU_PROBE_MAX);
+    mesh_corr_flush_frame();
+}
+static void mesh_corr_draw(uint64_t addr, uint64_t key, const uint32_t words[2]) {
+    if (key != g_mesh_corr_draw_key || !mesh_corr_config() || addr != g_mesh_corr.addr || g_mesh_corr.stopped) return;
+    uint64_t frame = vka_exec_submission_frame(), visit = 0;
+    int selected = mesh_corr_event(frame, key, 1, &visit);
+    if (!selected) return;
+    if (g_mesh_gpu_probe.count >= MESH_GPU_PROBE_MAX) { mesh_corr_drop(frame, visit, key, "draw", "shared_sample_cap"); mesh_corr_stop("shared_sample_cap"); return; }
+    VkBuffer source; VkDeviceSize offset;
+    if (!vka_addr(addr, 8, &source, &offset, NULL) || (offset & 3)) { mesh_corr_drop(frame, visit, key, "draw", "source_mapping"); return; }
+    if (!mesh_gpu_probe_init()) { mesh_corr_drop(frame, visit, key, "draw", "allocation_or_map"); mesh_corr_stop("allocation_or_map"); return; }
+    unsigned index = g_mesh_gpu_probe.count++;
+    mesh_gpu_sample *sample = &g_mesh_gpu_probe.samples[index];
+    *sample = (mesh_gpu_sample){.addr = addr, .key = key, .frame = frame, .visit = visit, .cpu = {words ? words[0] : 0, words ? words[1] : 0}, .index = index, .phase = 3, .mode = 4, .cpu_valid = words != NULL};
+    mesh_corr_sampled(frame, 1, 0, index, 1);
+    vka_rp_end(); vka_barrier(g_cb);
+    VkBufferCopy region = {offset, index * 8, 8}; vk.vkCmdCopyBuffer(g_cb, source, g_mesh_gpu_probe.buffer, 1, &region);
+    vka_barrier(g_cb);
+}
+static void mesh_gpu_probe_result(void *arg) {
+    mesh_gpu_sample *sample = arg;
+    uint32_t gpu[2];
+    pthread_mutex_lock(&g_mesh_gpu_probe_mu);
+    int invalid = sample->invalid || (g_mesh_gpu_probe.failed && sample->fence > g_mesh_gpu_probe.valid_through) || vka_hung();
+    if (!invalid) memcpy(gpu, g_mesh_gpu_probe.mapped + 2 * sample->index, sizeof gpu);
+    pthread_mutex_unlock(&g_mesh_gpu_probe_mu);
+    if (invalid) {
+        if (sample->mode == 4) VLOG("TEMP mesh correlation sample=%u phase=%s frame=%llu visit=%llu fence=%llu key=%016llx addr=%#llx invalid=failed_submission_or_hang",
+                                    sample->index, sample->phase == 1 ? "dispatch_before" : sample->phase == 2 ? "dispatch_after" : "draw",
+                                    (unsigned long long)sample->frame, (unsigned long long)sample->visit, (unsigned long long)sample->fence,
+                                    (unsigned long long)sample->key, (unsigned long long)sample->addr);
+        else VLOG("TEMP %s GPU copy sample=%u fence=%llu invalid=failed_submission_or_hang", sample->phase ? "dispatch" : "mesh", sample->index, (unsigned long long)sample->fence);
+        return;
+    }
+    if (sample->mode == 4) {
+        VLOG("TEMP mesh correlation sample=%u phase=%s frame=%llu visit=%llu fence=%llu key=%016llx addr=%#llx cpu_valid=%d cpu=%u,%u gpu=%u,%u",
+             sample->index, sample->phase == 1 ? "dispatch_before" : sample->phase == 2 ? "dispatch_after" : "draw",
+             (unsigned long long)sample->frame, (unsigned long long)sample->visit, (unsigned long long)sample->fence,
+             (unsigned long long)sample->key, (unsigned long long)sample->addr, sample->cpu_valid,
+             sample->cpu[0], sample->cpu[1], gpu[0], gpu[1]);
+        return;
+    }
+    if (sample->phase) {
+        VLOG("TEMP dispatch GPU copy sample=%u phase=%s frame=%llu visit=%llu fence=%llu key=%016llx addr=%#llx gpu=%u,%u",
+             sample->index, sample->phase == 1 ? "before" : "after", (unsigned long long)sample->frame,
+             (unsigned long long)sample->visit, (unsigned long long)sample->fence, (unsigned long long)sample->key,
+             (unsigned long long)sample->addr, gpu[0], gpu[1]); return;
+    }
+    VLOG("TEMP mesh GPU copy sample=%u frame=%llu visit=%llu fence=%llu key=%016llx addr=%#llx cpu=%u,%u gpu=%u,%u",
+         sample->index, (unsigned long long)sample->frame, (unsigned long long)sample->visit, (unsigned long long)sample->fence,
+         (unsigned long long)sample->key, (unsigned long long)sample->addr, sample->cpu[0], sample->cpu[1], gpu[0], gpu[1]);
+}
+void vka_mesh_gpu_probe_commit(uint64_t fence, int success) {
+    uint8_t valid[MESH_GPU_PROBE_MAX] = {0};
+    pthread_mutex_lock(&g_mesh_gpu_probe_mu);
+    if (!success && !g_mesh_gpu_probe.failed) {
+        g_mesh_gpu_probe.failed = 1;
+        g_mesh_gpu_probe.valid_through = vka_done();
+    }
+    unsigned first = g_mesh_gpu_probe.pending, end = g_mesh_gpu_probe.count;
+    for (unsigned index = 0; index < first; index++) {
+        mesh_gpu_sample *sample = &g_mesh_gpu_probe.samples[index];
+        if (g_mesh_gpu_probe.failed && sample->fence > g_mesh_gpu_probe.valid_through) sample->invalid = 1;
+    }
+    for (unsigned index = first; index < end; index++) {
+        mesh_gpu_sample *sample = &g_mesh_gpu_probe.samples[index];
+        sample->fence = fence;
+        sample->invalid = !success || (g_mesh_gpu_probe.failed && fence > g_mesh_gpu_probe.valid_through);
+        valid[index] = !sample->invalid;
+    }
+    g_mesh_gpu_probe.pending = end;
+    pthread_mutex_unlock(&g_mesh_gpu_probe_mu);
+    for (unsigned index = first; index < end; index++) {
+        mesh_gpu_sample *sample = &g_mesh_gpu_probe.samples[index];
+        if (valid[index]) vka_after(fence, mesh_gpu_probe_result, sample);
+        else if (sample->mode == 4) VLOG("TEMP mesh correlation sample=%u phase=%s frame=%llu visit=%llu fence=%llu key=%016llx addr=%#llx invalid=%s",
+                                          index, sample->phase == 1 ? "dispatch_before" : sample->phase == 2 ? "dispatch_after" : "draw",
+                                          (unsigned long long)sample->frame, (unsigned long long)sample->visit, (unsigned long long)fence,
+                                          (unsigned long long)sample->key, (unsigned long long)sample->addr,
+                                          success ? "earlier_submit_failure" : "part_or_final_submit");
+        else VLOG("TEMP %s GPU copy sample=%u fence=%llu invalid=%s", sample->phase ? "dispatch" : "mesh", index, (unsigned long long)fence,
+                  success ? "earlier_submit_failure" : "part_or_final_submit");
+    }
+}
+static void mesh_gpu_probe(uint64_t addr, uint64_t key, const uint32_t words[2]) {
+    int mode = VKA_ENV("DM_VK_MESH_GPU_COPY", 0);
+    if (mode == 4) { mesh_corr_draw(addr, key, words); return; }
+    if (mode == 3) {
+        static uint64_t visits;
+        const char *filter = getenv("DM_VK_MESH_GW_KEY");
+        if (filter && *filter && strtoull(filter, NULL, 16) == key) {
+            uint64_t visit = ++visits;
+            if ((visit - 1) % 32 == 0 && visit <= 4096)
+                VLOG("TEMP dispatch probe mesh visit=%llu frame=%llu key=%016llx addr=%#llx cpu=%u,%u", (unsigned long long)visit,
+                     (unsigned long long)vka_exec_submission_frame(), (unsigned long long)key, (unsigned long long)addr, words[0], words[1]);
+        }
+        return;
+    }
+    if (mode != 1 && mode != 2) return;
+    const char *filter = getenv("DM_VK_MESH_GW_KEY");
+    if (!filter || !*filter || strtoull(filter, NULL, 16) != key) return;
+    uint64_t visit = ++g_mesh_gpu_probe.visits;
+    if ((visit - 1) % 32) return;
+    if (g_mesh_gpu_probe.attempts >= MESH_GPU_PROBE_MAX || g_mesh_gpu_probe.count >= MESH_GPU_PROBE_MAX) {
+        if (!g_mesh_gpu_probe.cap_logged) {
+            g_mesh_gpu_probe.cap_logged = 1;
+            VLOG("TEMP mesh GPU copy dropped selected visit=%llu: %s; later selected visits dropped", (unsigned long long)visit,
+                 g_mesh_gpu_probe.count >= MESH_GPU_PROBE_MAX ? "shared sample capacity exhausted" : "attempted sample cap reached");
+        }
+        return;
+    }
+    unsigned attempt = ++g_mesh_gpu_probe.attempts;
+    VkBuffer source; VkDeviceSize offset;
+    if (addr > UINT64_MAX - 8 || !vka_addr(addr, 8, &source, &offset, NULL) || (offset & 3)) {
+        VLOG("TEMP mesh GPU copy dropped attempt=%u/%u visit=%llu addr=%#llx invalid_mapping", attempt, MESH_GPU_PROBE_MAX, (unsigned long long)visit, (unsigned long long)addr); return;
+    }
+    if (mode == 1 && !mesh_gpu_probe_init()) return;
+    unsigned index = g_mesh_gpu_probe.count++;
+    mesh_gpu_sample *sample = &g_mesh_gpu_probe.samples[index];
+    *sample = (mesh_gpu_sample){.addr = addr, .key = key, .frame = vka_exec_submission_frame(), .visit = visit, .cpu = {words[0], words[1]}, .index = index};
+    vka_rp_end(); vka_barrier(g_cb);
+    if (mode == 1) { VkBufferCopy region = {offset, index * 8, 8}; vk.vkCmdCopyBuffer(g_cb, source, g_mesh_gpu_probe.buffer, 1, &region); }
+    vka_barrier(g_cb);
+    if (mode == 2) VLOG("TEMP mesh GPU copy control sample=%u frame=%llu visit=%llu key=%016llx addr=%#llx cpu=%u,%u",
+                        index, (unsigned long long)sample->frame, (unsigned long long)visit, (unsigned long long)key,
+                        (unsigned long long)addr, words[0], words[1]);
+    if (mode == 2) g_mesh_gpu_probe.pending = g_mesh_gpu_probe.count;
+}
+static int mesh_dispatch_corr_begin(uint64_t key, VkBuffer *source, VkDeviceSize *offset) {
+    int which = key == g_mesh_corr_dispatch_key[0] ? 0 : key == g_mesh_corr_dispatch_key[1] ? 1 : -1;
+    if (which < 0 || !mesh_corr_config() || g_mesh_corr.stopped) return -1;
+    uint64_t frame = vka_exec_submission_frame(), visit = 0;
+    int selected = mesh_corr_event(frame, key, 0, &visit);
+    if (!selected) return -1;
+    if (g_mesh_gpu_probe.count > MESH_GPU_PROBE_MAX - 2) {
+        mesh_corr_drop(frame, visit, key, "dispatch", "shared_sample_cap"); mesh_corr_stop("shared_sample_cap"); return -1;
+    }
+    if (!vka_addr(g_mesh_corr.addr, 8, source, offset, NULL) || (*offset & 3)) {
+        mesh_corr_drop(frame, visit, key, "dispatch", "source_mapping"); return -1;
+    }
+    if (!mesh_gpu_probe_init()) { mesh_corr_drop(frame, visit, key, "dispatch", "allocation_or_map"); mesh_corr_stop("allocation_or_map"); return -1; }
+    unsigned index = g_mesh_gpu_probe.count;
+    mesh_gpu_sample *before = &g_mesh_gpu_probe.samples[index], *after = &g_mesh_gpu_probe.samples[index + 1];
+    *before = (mesh_gpu_sample){.addr = g_mesh_corr.addr, .key = key, .frame = frame, .visit = visit, .index = index, .phase = 1, .mode = 4};
+    *after = *before; after->index = index + 1; after->phase = 2;
+    g_mesh_gpu_probe.count += 2;
+    mesh_corr_sampled(frame, 0, which, index, 2);
+    vka_barrier(g_cb);
+    VkBufferCopy region = {*offset, index * 8, 8}; vk.vkCmdCopyBuffer(g_cb, *source, g_mesh_gpu_probe.buffer, 1, &region);
+    vka_barrier(g_cb);
+    return (int)index;
+}
+static int mesh_dispatch_probe_begin(uint64_t key, VkBuffer *source, VkDeviceSize *offset) {
+    int mode = VKA_ENV("DM_VK_MESH_GPU_COPY", 0);
+    if (mode == 4) return mesh_dispatch_corr_begin(key, source, offset);
+    if (mode != 3) return -1;
+    static uint64_t visits[2]; static unsigned selected[2]; static int cap_logged[2];
+    int which = key == 0x510c344f1b4e4e55ull ? 0 : key == 0xa22751e0034b3981ull ? 1 : -1;
+    if (which < 0) return -1;
+    uint64_t visit = ++visits[which];
+    if ((visit - 1) % 16) return -1;
+    if (selected[which] >= 32 || g_mesh_gpu_probe.count > MESH_GPU_PROBE_MAX - 2) {
+        if (!cap_logged[which]) { cap_logged[which] = 1; VLOG("TEMP dispatch GPU copy key=%016llx visit=%llu dropped=cap", (unsigned long long)key, (unsigned long long)visit); }
+        return -1;
+    }
+    selected[which]++;
+    const char *value = getenv("DM_VK_GML_WATCH_PAGE"); char *end = NULL; errno = 0;
+    unsigned long long addr = value && *value ? strtoull(value, &end, 16) : 0;
+    if (!value || !*value || *value == '-' || errno || !end || *end || !addr || addr > UINT64_MAX - 8 ||
+        !vka_addr(addr, 8, source, offset, NULL) || (*offset & 3)) {
+        VLOG("TEMP dispatch GPU copy key=%016llx visit=%llu dropped=invalid_address_or_mapping", (unsigned long long)key, (unsigned long long)visit); return -1;
+    }
+    if (!mesh_gpu_probe_init()) { VLOG("TEMP dispatch GPU copy key=%016llx visit=%llu dropped=allocation", (unsigned long long)key, (unsigned long long)visit); return -1; }
+    unsigned index = g_mesh_gpu_probe.count; g_mesh_gpu_probe.count += 2;
+    mesh_gpu_sample *before = &g_mesh_gpu_probe.samples[index], *after = &g_mesh_gpu_probe.samples[index + 1];
+    *before = (mesh_gpu_sample){.addr = addr, .key = key, .frame = vka_exec_submission_frame(), .visit = visit, .index = index, .phase = 1};
+    *after = *before; after->index = index + 1; after->phase = 2;
+    vka_barrier(g_cb);
+    VkBufferCopy region = {*offset, index * 8, 8}; vk.vkCmdCopyBuffer(g_cb, *source, g_mesh_gpu_probe.buffer, 1, &region);
+    vka_barrier(g_cb);
+    return (int)index;
+}
+static void mesh_dispatch_probe_end(int index, VkBuffer source, VkDeviceSize offset) {
+    if (index < 0) return;
+    VkBufferCopy region = {offset, (unsigned)(index + 1) * 8, 8};
+    vk.vkCmdCopyBuffer(g_cb, source, g_mesh_gpu_probe.buffer, 1, &region);
+    vka_barrier(g_cb);
+}
+static void mesh_wait_candidate(uint64_t addr, uint32_t words[2]) {
+    if (!VKA_ENV("DM_VK_MESH_WAIT_CANDIDATE", 0) || words[0] || vka_hung()) return;
+    static _Thread_local unsigned total, attempted, completed, timed_out, recovered, read_failed, aborted;
+    static _Thread_local uint64_t timed_out_fence;
+    if (total >= 512) return;
+    uint64_t fence = 0; unsigned flags = vka_tex_gw_probe(addr, 8, &fence);
+    if (!fence || fence == timed_out_fence || fence > vka_fence_queued() || (flags & VKA_GW_INVALID_RANGE)) return;
+    int done = vka_wait_done(fence, 20000000ull);
+    int hung = vka_hung(); uint32_t after[2] = {0}; int reread = done && !hung && cpu_read(addr, after, sizeof after);
+    total++; attempted++; if (hung) aborted++; else if (done) completed++; else { timed_out++; timed_out_fence = fence; }
+    if (done && !hung && !reread) read_failed++;
+    if (reread) { if (after[0]) recovered++; memcpy(words, after, sizeof after); }
+    if (attempted >= 128 || total == 512 || hung) {
+        VLOG("TEMP mesh candidate wait attempts=%u completed=%u timeout=%u zero_to_positive=%u reread_failed=%u hang_aborted=%u total=%u limit=512", attempted, completed, timed_out, recovered, read_failed, aborted, total);
+        attempted = completed = timed_out = recovered = read_failed = aborted = 0;
+    }
+}
 static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; return cpu_read(addr, out, n); }
 // A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
@@ -809,8 +1125,8 @@ static void spill_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t ns) {
     #undef PART
     #undef MIN
 }
-static int gmem_log(VkDescriptorBufferInfo *bi) {
-    if (vka_tex_gml_take(bi)) return 1;   // read when the submission is done: the textures over the pages its stores wrote are uploaded again
+static int gmem_log(VkDescriptorBufferInfo *bi, uint64_t key, int stage) {
+    if (vka_tex_gml_take(bi, key, stage)) return 1;   // read when the submission is done: the textures over the pages its stores wrote are uploaded again
     size_t n = ((size_t)1 + (1u << DMSH_GMEM_LOG_LOG2)) * 4;
     vka_span s; if (!vka_scratch(n, V.sb_align, &s)) return 0;
     memset(s.ptr, 0, n);
@@ -854,6 +1170,14 @@ static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
 // bound size (dd<n>_s<stage>_b<binding>_<address>.bin; unreadable 256-byte pieces as zeros), each driver segment as the replay fills it (dd<n>_s<stage>_drv<bank>.bin), each
 // vertex stream and the index buffer; dd.txt lists each file with its address, the draw's arguments and its storage descriptors' offsets. For evaluating one draw's shader
 // off the phone (a UI draw that writes no pixels: the inputs its positions come from)
+static int tmp_skip_key(const char *var, uint64_t key, uint64_t *fr, uint64_t *sk, int *nsk) {   // TEMP
+    uint64_t vka_frame(void);
+    if (*fr != vka_frame()) { *fr = vka_frame(); *nsk = 0; const char *e = getenv(var); char gv[96];
+        if (e && *e == '@') { snprintf(gv, sizeof gv, "%s_%s", var, e + 1); e = getenv(gv); }
+        for (const char *p = e; p && *p && *nsk < 32;) { char *x; uint64_t k = strtoull(p, &x, 16); if (x == p) break; sk[(*nsk)++] = k; p = *x == ',' ? x + 1 : x; } }
+    for (int i = 0; i < *nsk; i++) if (sk[i] == key) { static _Atomic int nl; if (atomic_fetch_add(&nl, 1) < 400) VLOG("TEMP skip %s %016llx frame %llu", var, (unsigned long long)key, (unsigned long long)vka_frame()); return 1; }
+    return 0;
+}
 static struct { int init, on, n, max; uint64_t key; char dir[192]; } g_dd;
 static void dd_note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dd_note(const char *fmt, ...) {
@@ -1054,7 +1378,14 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             case VKA_R_BUF: { uint64_t back = 0, own = 0;
                 ok = storage ? ssbo_desc(r[i].addr, r[i].size, r[i].c0base, bi, &back, &own) : ubo_desc(r[i].addr, r[i].size, bi);
                 // the shader may store into it: its bound size, or with none the run in its own segment (a span buffer's run over 100+ MiB would re-upload every texture there)
-                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, r[i].size && r[i].size < bi->range - back ? r[i].size : own);
+                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) {
+                    uint64_t length = r[i].size && r[i].size < bi->range - back ? r[i].size : own;
+                    vka_tex_gw_opaque(r[i].addr, length);
+                    if (VKA_ENV("DM_VK_MESH_BIND_WATCH", 0)) {
+                        if (back <= r[i].addr) vka_tex_gw_watch_binding(r[i].addr - back, bi->range, sh->key, st, r[i].binding);
+                        else VRED_ONCE("TEMP mesh binding watch: descriptor guest start underflow; coverage incomplete");
+                    }
+                }
                 // DM_VK_REACH_LOG=<n>: the first n bindings cut short (the bound size past the run, or placed memory right after the run)
                 if (ok && g_cut.what) { static _Atomic int nl; if (atomic_fetch_add(&nl, 1) < VKA_ENV("DM_VK_REACH_LOG", 0))
                     VLOG("[reach] %s %016llx stage %d binding %u (%s): %#llx+%#llx bound to %#llx of %#llx asked (%s)", st == 5 ? "dispatch" : "draw", (unsigned long long)sh->key, st, r[i].binding,
@@ -1077,7 +1408,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                 if (g_tm) PS_ADD(3, cntvct() - td_);
                 break; }
             case VKA_R_GMEM_MAP: { int px_ = (r[i].flags & DMSH_VK_BF_PIDX) != 0; uint64_t tg_ = VKA_RP_T0(); ok = px_ ? gmem_pidx(bi) : gmem_map(bi); VKA_RP_ADD(px_ ? VKA_RPX_PIDX : VKA_RPX_GMAP, tg_); break; }   // (an older library's records: no flag, the table alone)
-            case VKA_R_GMEM_LOG: ok = gmem_log(bi); break;
+            case VKA_R_GMEM_LOG: ok = gmem_log(bi, sh->key, st); break;
             case VKA_R_SHARED_SPILL: ok = st == 5 && g_spill_range && g_spill.buf; if (ok) *bi = (VkDescriptorBufferInfo){g_spill.buf, g_spill.off, g_spill_range}; break;
             default: ok = 0; break;
             }
@@ -1205,7 +1536,140 @@ static int push_same(VkPipelineBindPoint bp, VkPipelineLayout layout) {
 // Draws and dispatches whose shaders read the texture pool through the bindless table (set 1: any registered texture, indexed on the GPU), for the ctl stats line
 static _Atomic uint64_t g_bs_all, g_bs_pool;
 uint64_t now_ns(void);   // (the host's monotonic clock: the pool scan's memo)
-uint64_t vka_frame(void);
+enum { MESH_INDIRECT_DIAG_FRAMES = 120, MESH_INDIRECT_DIAG_BINS = 6, MESH_INDIRECT_DIAG_MAX_WINDOWS = 96, MESH_INDIRECT_DIAG_KEYS = 32 };
+static const uint64_t MESH_INDIRECT_DIAG_NS = 2000000000ull;
+typedef struct { uint64_t key, counts[3]; } mesh_indirect_diag_shader;
+typedef struct {
+    uint64_t id, start_ns, end_ns, start_frame, first_frame, last_frame;
+    uint64_t reads, zero, positive, unreadable, bins[MESH_INDIRECT_DIAG_BINS];
+    uint64_t overflow[3], unknown[3];
+    mesh_indirect_diag_shader shaders[MESH_INDIRECT_DIAG_KEYS];
+    unsigned shader_n;
+    int active;
+} mesh_indirect_diag_window;
+static pthread_mutex_t g_mesh_indirect_diag_mu = PTHREAD_MUTEX_INITIALIZER;
+static mesh_indirect_diag_window g_mesh_indirect_diag;
+static _Atomic int g_mesh_indirect_diag_enabled = -1, g_mesh_indirect_diag_active;
+static unsigned g_mesh_indirect_diag_emitted;
+static uint64_t g_mesh_indirect_diag_next_id;
+static int mesh_indirect_diag_finish_locked(mesh_indirect_diag_window *done) {
+    if (!g_mesh_indirect_diag.active) return 0;
+    *done = g_mesh_indirect_diag;
+    memset(&g_mesh_indirect_diag, 0, sizeof g_mesh_indirect_diag);
+    atomic_store_explicit(&g_mesh_indirect_diag_active, 0, memory_order_relaxed);
+    if (g_mesh_indirect_diag_emitted >= MESH_INDIRECT_DIAG_MAX_WINDOWS) return 0;
+    g_mesh_indirect_diag_emitted++;
+    return 1;
+}
+static void mesh_indirect_diag_log(const mesh_indirect_diag_window *w) {
+    char meshes[3072]; size_t used = 0;
+    for (unsigned i = 0; i < w->shader_n; i++) {
+        int n = snprintf(meshes + used, sizeof meshes - used, "%s%016llx:%llu/%llu/%llu", used ? "," : "",
+                         (unsigned long long)w->shaders[i].key, (unsigned long long)w->shaders[i].counts[0],
+                         (unsigned long long)w->shaders[i].counts[1], (unsigned long long)w->shaders[i].counts[2]);
+        if (n < 0 || (size_t)n >= sizeof meshes - used) { used = sizeof meshes - 1; break; }
+        used += (size_t)n;
+    }
+    int n = snprintf(meshes + used, sizeof meshes - used, "%soverflow=%llu/%llu/%llu;unknown=%llu/%llu/%llu", used ? ";" : "",
+                     (unsigned long long)w->overflow[0], (unsigned long long)w->overflow[1], (unsigned long long)w->overflow[2],
+                     (unsigned long long)w->unknown[0], (unsigned long long)w->unknown[1], (unsigned long long)w->unknown[2]);
+    if (n < 0 || (size_t)n >= sizeof meshes - used) meshes[sizeof meshes - 1] = 0;
+    VLOG("TEMP mesh-indirect window=%llu submission_frames=%llu-%llu start_mono_ns=%llu end_mono_ns=%llu elapsed_ms=%.3f reads=%llu zero=%llu positive=%llu unreadable=%llu positive_hist[1,2-4,5-16,17-64,65-256,>256]=%llu,%llu,%llu,%llu,%llu,%llu mesh_shader_counts={%s} output_budget=%u",
+         (unsigned long long)w->id, (unsigned long long)w->first_frame, (unsigned long long)w->last_frame,
+         (unsigned long long)w->start_ns, (unsigned long long)w->end_ns, (w->end_ns - w->start_ns) / 1e6,
+         (unsigned long long)w->reads, (unsigned long long)w->zero, (unsigned long long)w->positive, (unsigned long long)w->unreadable,
+         (unsigned long long)w->bins[0], (unsigned long long)w->bins[1], (unsigned long long)w->bins[2], (unsigned long long)w->bins[3], (unsigned long long)w->bins[4], (unsigned long long)w->bins[5], meshes, MESH_INDIRECT_DIAG_MAX_WINDOWS);
+}
+void vka_draw_mesh_indirect_diag_control(int enabled) {
+    mesh_indirect_diag_window done; int emit = 0;
+    enabled = enabled != 0;
+    if (atomic_load_explicit(&g_mesh_indirect_diag_enabled, memory_order_relaxed) == enabled) return;
+    pthread_mutex_lock(&g_mesh_indirect_diag_mu);
+    int was = atomic_load_explicit(&g_mesh_indirect_diag_enabled, memory_order_relaxed);
+    if (was != enabled) {
+        if (enabled) {
+            memset(&g_mesh_indirect_diag, 0, sizeof g_mesh_indirect_diag);
+            atomic_store_explicit(&g_mesh_indirect_diag_active, 0, memory_order_relaxed);
+        } else emit = mesh_indirect_diag_finish_locked(&done);
+        atomic_store_explicit(&g_mesh_indirect_diag_enabled, enabled, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_mesh_indirect_diag_mu);
+    if (emit) mesh_indirect_diag_log(&done);
+}
+void vka_draw_mesh_indirect_diag_frame(void) {
+    if (!atomic_load_explicit(&g_mesh_indirect_diag_active, memory_order_relaxed)) return;
+    uint64_t now = now_ns(); mesh_indirect_diag_window done; int emit = 0;
+    pthread_mutex_lock(&g_mesh_indirect_diag_mu);
+    if (g_mesh_indirect_diag.active && now >= g_mesh_indirect_diag.start_ns && now - g_mesh_indirect_diag.start_ns >= MESH_INDIRECT_DIAG_NS)
+        emit = mesh_indirect_diag_finish_locked(&done);
+    pthread_mutex_unlock(&g_mesh_indirect_diag_mu);
+    if (emit) mesh_indirect_diag_log(&done);
+}
+void vka_draw_mesh_indirect_diag_submission(uint64_t frame) {
+    if (!atomic_load_explicit(&g_mesh_indirect_diag_active, memory_order_relaxed)) return;
+    uint64_t now = now_ns(); mesh_indirect_diag_window done; int emit = 0;
+    pthread_mutex_lock(&g_mesh_indirect_diag_mu);
+    if (g_mesh_indirect_diag.active &&
+        ((frame < g_mesh_indirect_diag.start_frame) || frame - g_mesh_indirect_diag.start_frame >= MESH_INDIRECT_DIAG_FRAMES ||
+         (now >= g_mesh_indirect_diag.start_ns && now - g_mesh_indirect_diag.start_ns >= MESH_INDIRECT_DIAG_NS)))
+        emit = mesh_indirect_diag_finish_locked(&done);
+    pthread_mutex_unlock(&g_mesh_indirect_diag_mu);
+    if (emit) mesh_indirect_diag_log(&done);
+}
+void vka_draw_mesh_indirect_diag_flush(void) {
+    mesh_indirect_diag_window done; int emit;
+    pthread_mutex_lock(&g_mesh_indirect_diag_mu);
+    emit = mesh_indirect_diag_finish_locked(&done);
+    pthread_mutex_unlock(&g_mesh_indirect_diag_mu);
+    if (emit) mesh_indirect_diag_log(&done);
+    mesh_corr_flush_frame();
+}
+static void mesh_indirect_diag(uint64_t frame, uint64_t mesh_key, int key_available, int readable, uint32_t count) {
+    if (!VKA_ENV("DM_VK_MESH_INDIRECT_DIAG", 0)) { vka_draw_mesh_indirect_diag_control(0); return; }
+    vka_draw_mesh_indirect_diag_control(1);
+    uint64_t now = now_ns(); mesh_indirect_diag_window done; int emit = 0;
+    pthread_mutex_lock(&g_mesh_indirect_diag_mu);
+    if (g_mesh_indirect_diag_emitted >= MESH_INDIRECT_DIAG_MAX_WINDOWS) { pthread_mutex_unlock(&g_mesh_indirect_diag_mu); return; }
+    if (g_mesh_indirect_diag.active &&
+        (frame < g_mesh_indirect_diag.start_frame || frame - g_mesh_indirect_diag.start_frame >= MESH_INDIRECT_DIAG_FRAMES ||
+         (now >= g_mesh_indirect_diag.start_ns && now - g_mesh_indirect_diag.start_ns >= MESH_INDIRECT_DIAG_NS)))
+        emit = mesh_indirect_diag_finish_locked(&done);
+    if (emit && g_mesh_indirect_diag_emitted >= MESH_INDIRECT_DIAG_MAX_WINDOWS) {
+        pthread_mutex_unlock(&g_mesh_indirect_diag_mu);
+        mesh_indirect_diag_log(&done);
+        return;
+    }
+    if (!g_mesh_indirect_diag.active) {
+        memset(&g_mesh_indirect_diag, 0, sizeof g_mesh_indirect_diag);
+        g_mesh_indirect_diag.active = 1; g_mesh_indirect_diag.id = ++g_mesh_indirect_diag_next_id;
+        g_mesh_indirect_diag.start_ns = g_mesh_indirect_diag.end_ns = now;
+        g_mesh_indirect_diag.start_frame = g_mesh_indirect_diag.first_frame = g_mesh_indirect_diag.last_frame = frame;
+        atomic_store_explicit(&g_mesh_indirect_diag_active, 1, memory_order_relaxed);
+    }
+    mesh_indirect_diag_window *w = &g_mesh_indirect_diag;
+    if (frame < w->first_frame) w->first_frame = frame;
+    if (frame > w->last_frame) w->last_frame = frame;
+    w->end_ns = now; w->reads++;
+    unsigned kind;
+    if (!readable) { w->unreadable++; kind = 2; }
+    else if (!count) { w->zero++; kind = 0; }
+    else {
+        w->positive++;
+        kind = 1;
+        unsigned bin = count == 1 ? 0 : count <= 4 ? 1 : count <= 16 ? 2 : count <= 64 ? 3 : count <= 256 ? 4 : 5;
+        w->bins[bin]++;
+    }
+    if (!key_available) w->unknown[kind]++;
+    else {
+        unsigned i = 0;
+        while (i < w->shader_n && w->shaders[i].key != mesh_key) i++;
+        if (i == w->shader_n && w->shader_n < MESH_INDIRECT_DIAG_KEYS) w->shaders[w->shader_n++].key = mesh_key;
+        if (i < w->shader_n) w->shaders[i].counts[kind]++;
+        else w->overflow[kind]++;
+    }
+    pthread_mutex_unlock(&g_mesh_indirect_diag_mu);
+    if (emit) mesh_indirect_diag_log(&done);
+}
 void vka_draw_pool_stats(uint64_t *all, uint64_t *pool) { *all = g_bs_all; *pool = g_bs_pool; }
 // Lazy images (vka_tex.c write_tables): the texture IDs a draw or dispatch whose shaders read the texture pool may index get their images and slots before it, from the walk
 // (walk_all, just before). Those its storage buffers name, of every stage (a handle one stage reads may reach the stage that reads the pool as a varying), or every registered
@@ -1499,6 +1963,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     // (vka_pso.c pstate_fill) drawn with vkCmdDrawMeshTasksEXT: no vertex input, primitive type or index buffer
     const int mesh = dw && dw->prim == NVN_PRIM_MESH;
     int mcount = mesh ? dw->count : 0, mfirst = mesh ? dw->first : 0;   // a mesh draw's workgroups
+    VkBuffer mbuf = VK_NULL_HANDLE; VkDeviceSize moff = 0; int mgpu = 0;   // a mesh indirect draw whose record the GPU reads (V.mesh_nv_ind)
     if (mesh) {
         if (!V.mesh) SKIP("mesh draw (nvnCommandBufferDrawMeshTasks) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0): skipped");
         // The program whose task and mesh shaders run: the fragment stage's when it has a mesh shader (a program's stages are bound together), else the one bound at the
@@ -1517,12 +1982,21 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (sh[1] && !(sh[1]->e->flags & DMSH_VK_F_MESH_PRIM) && (sh[7]->e->flags & DMSH_VK_F_MESH_PRIM))
             VRED_ONCE("mesh draw: mesh shader %016llx writes per-primitive outputs and pixel shader %016llx has no per-primitive inputs: any it reads there are undefined", (unsigned long long)sh[7]->key, (unsigned long long)sh[1]->key);
         // nvnCommandBufferDrawMeshTasksIndirect: the record at the address is two words, {count, first} (as GL_NV_mesh_shader's DrawMeshTasksIndirectCommandNV, not
-        // VK_EXT_mesh_shader's three group counts: Ocarina of Time's foliage has 131 0 there, and a 0 in the next word, which as Vulkan's y and z would draw nothing). The
-        // game writes it on the CPU before it submits the command buffer, so it is read here, when the draw is replayed, and drawn as a direct draw. Open: a record that
-        // the GPU writes (a compute pass's count) would be read too early; none seen
-        if (dw->ind) {
+        // VK_EXT_mesh_shader's three group counts: Ocarina of Time's foliage has 131 0 there, and a 0 in the next word, which as Vulkan's y and z would draw nothing).
+        // With V.mesh_nv_ind the driver reads the record itself, in command order: after the compute shaders that write it (Ocarina of Time's foliage counts are written
+        // by compute in the same submission; read on the CPU at replay they were often still 0 and the foliage draw was dropped, so foliage flickered)
+        if (dw->ind && V.mesh_nv_ind && VKA_ENV("DM_VK_MESH_GPU_IND", 1)) {
+            if (!vka_addr(dw->ind, 8, &mbuf, &moff, NULL) || (moff & 3)) SKIP("mesh indirect draw arguments at %#llx are not in a guest buffer: skipped", (unsigned long long)dw->ind);
+            mgpu = 1; mcount = 1; mfirst = 0;
+        } else if (dw->ind) {
             uint32_t w[2] = {0};
-            if (!cpu_read(dw->ind, w, 8)) SKIP("mesh indirect draw arguments at %#llx are not readable: skipped", (unsigned long long)dw->ind);
+            int readable = cpu_read(dw->ind, w, 8);
+            if (readable) mesh_wait_candidate(dw->ind, w);
+            if (VKA_ENV("DM_VK_MESH_GPU_COPY", 0) == 4) mesh_gpu_probe(dw->ind, sh[7]->key, readable ? w : NULL);
+            else if (readable) mesh_gpu_probe(dw->ind, sh[7]->key, w);
+            vka_mesh_arg_probe_read(dw->ind, readable, w, sh[7]->key);
+            if (!readable) { mesh_indirect_diag(vka_exec_submission_frame(), sh[7] ? sh[7]->key : 0, sh[7] != NULL, 0, 0); SKIP("mesh indirect draw arguments at %#llx are not readable: skipped", (unsigned long long)dw->ind); }
+            mesh_indirect_diag(vka_exec_submission_frame(), sh[7] ? sh[7]->key : 0, sh[7] != NULL, 1, w[0]);
             mcount = (int)w[0]; mfirst = (int)w[1];
             static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("mesh indirect draw: %u workgroups from %u (task %016llx mesh %016llx)", w[0], w[1], sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key);
         }
@@ -1595,6 +2069,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         int on = R.on; vka_rp_end(); (void)on;
         vka_nan_inputs(g_cb, ims, bs, ts, m);
     }
+    { static uint64_t fr = ~0ull, sk[32]; static int nsk; if (sh[1] && tmp_skip_key("DM_VK_TMP_SKIP_FS", sh[1]->key, &fr, sk, &nsk)) { g_skipped++; return; } }   // TEMP
     if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
     d->b.samples = R.samples;
@@ -1739,8 +2214,10 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     PT(7);
     // The draw
     uint32_t inst = (uint32_t)((dw ? dw->instances : di->instances) > 0 ? (dw ? dw->instances : di->instances) : 1), binst = d->b.base_instance;
-    if (vka_gp_split) vka_gp_draw(g_cb, p, mesh ? (sh[7] ? sh[7]->key : 0) : sh[0] ? sh[0]->key : 0, fs ? fs->key : 0, ind ? 0 : (uint64_t)(uint32_t)(mesh ? mcount : dw ? dw->count : di->count) * inst, ind != 0);   // DM_VK_GPUPROF_SPLIT
-    if (mesh) {   // count workgroups of the task shader, or of the mesh shader without one (the device's limit per dimension: maxTaskWorkGroupCount / maxMeshWorkGroupCount, 65535 on the Adreno 840)
+    if (vka_gp_split) vka_gp_draw(g_cb, p, mesh ? (sh[7] ? sh[7]->key : 0) : sh[0] ? sh[0]->key : 0, fs ? fs->key : 0, ind || mgpu ? 0 : (uint64_t)(uint32_t)(mesh ? mcount : dw ? dw->count : di->count) * inst, ind != 0 || mgpu);   // DM_VK_GPUPROF_SPLIT
+    if (mgpu) {   // no CPU check of the count: Turnip draws up to its fixed chunk capacity (tu_mesh.h: 32 mesh / 4 task chunks, thousands of workgroups)
+        vk.vkCmdDrawMeshTasksIndirectEXT(g_cb, mbuf, moff, 1, VKA_MESH_NV_STRIDE);
+    } else if (mesh) {   // count workgroups of the task shader, or of the mesh shader without one (the device's limit per dimension: maxTaskWorkGroupCount / maxMeshWorkGroupCount, 65535 on the Adreno 840)
         static uint32_t largest; if ((uint32_t)mcount > largest) { largest = (uint32_t)mcount; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("mesh draw: largest so far %u workgroups (task %016llx mesh %016llx)", largest, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key); }
         uint32_t maxg = sh[6] ? V.task_groups : V.mesh_groups;
         if ((uint32_t)mcount > maxg) SKIP("mesh draw of %d workgroups: more than the device's %u in one dimension; skipped", mcount, maxg);
@@ -2032,7 +2509,10 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     if (sk && *sk) { char *e; unsigned long long a = strtoull(sk, &e, 10), b = *e == ',' ? strtoull(e + 1, NULL, 10) : ~0ull; skip = di >= a && di <= b; }
     if (lg) VLOG("dispatch %llu: %016llx groups %d,%d,%d%s local %u,%u,%u shared %u flags %#x%s", di, (unsigned long long)sh[5]->key, dp->x, dp->y, dp->z, dp->ind ? " (indirect)" : "",
                  sh[5]->e->local[0], sh[5]->e->local[1], sh[5]->e->local[2], sh[5]->e->shared, sh[5]->e->flags, skip ? " SKIPPED" : "");
+    { static uint64_t fr2 = ~0ull, sk2[32]; static int nsk2; if (tmp_skip_key("DM_VK_TMP_SKIP_CS", sh[5]->key, &fr2, sk2, &nsk2)) skip = 1; }   // TEMP
     if (skip) { vka_barrier(g_cb); g_dispatches++; return; }
+    VkBuffer probe_source = VK_NULL_HANDLE; VkDeviceSize probe_offset = 0;
+    int probe_index = (dp->ind || (dp->x > 0 && dp->y > 0 && dp->z > 0)) ? mesh_dispatch_probe_begin(sh[5]->key, &probe_source, &probe_offset) : -1;
     vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     if (dp->ind) vk.vkCmdDispatchIndirect(g_cb, ib, io);
     else if (dp->x > 0 && dp->y > 0 && dp->z > 0) {
@@ -2041,6 +2521,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     }
     if (vka_gp_active) { char b[96]; snprintf(b, sizeof b, "dispatch %llu %016llx groups %d,%d,%d%s", di, (unsigned long long)sh[5]->key, dp->x, dp->y, dp->z, dp->ind ? " indirect" : ""); vka_gp_pass(b); }   // DM_VK_GPUPROF: the step it ends
     vka_barrier(g_cb);   // (also frees the shared memory spill buffer for the next dispatch)
+    mesh_dispatch_probe_end(probe_index, probe_source, probe_offset);
     if (vka_nan_on() && vka_nan_cs(sh[5]->key)) vka_nan_dispatch(g_cb, sh[5]->key, g_wk.r[5], g_wk.n[5]);   // DM_VK_NANSCAN_CS: the images it binds (the walk is this dispatch's)
     { int sl; VkBuffer sbuf; VkDeviceSize soff; const vka_range *r;   // the ctl bufshot: what this dispatch left in one storage slot
       if (vka_ctl_bufshot_want(di, &sl)) { r = &d->b.ssbo[5][sl];
