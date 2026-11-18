@@ -127,7 +127,8 @@ final class Folders {
         File save = save(a, g);
         String saveKey = "save_" + g.titleId;
 
-        row(a, box, Nup.isNup(new File(g.gameDir)) ? "Game (.nup file)" : "Game folder", g.gameDir, "Pick…", v -> { d[0].dismiss(); a.addGame(); }, null, null);
+        File gd = new File(g.gameDir);
+        row(a, box, Nup.isNup(gd) ? "Game (" + Nup.ext(gd) + " file)" : "Game folder", g.gameDir, "Pick…", v -> { d[0].dismiss(); a.addGame(); }, null, null);
         boolean inApp = SaveStore.inside(new File(g.packDir), AppStorage.packs(a));
         row(a, box, "Pack and shader folder (pack.tsv, shaders/)", g.packDir + (pack != null ? " (picked)" : inApp ? " (default: in the app's storage)" : " (default: beside the game)") + packState,
                 "Pick…", v -> { d[0].dismiss(); a.pickFolder(PICK_PACK, "Pick the pack folder (the one with pack.tsv and shaders/)"); },

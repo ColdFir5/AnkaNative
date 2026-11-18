@@ -168,7 +168,7 @@ final class DumpLayout {
     private static String find(Found f, File dump) {
         String fn = dump.getName();
         boolean nup = Nup.isNup(dump);
-        if (Nup.wrongCase(dump)) return fn + ": rename it so that its name ends in \".nup\" (lower case); the tools and the game read only that name.";
+        if (Nup.wrongCase(dump)) return fn + ": rename it so that its name ends in \"" + Nup.ext(dump) + "\" (lower case); the tools and the game read only that name.";
         if (nup) {
             if (!dump.isFile() || !dump.canRead()) return dump + " is not a file this app can read. Check that All files access is on.";
             try { Nup.open(dump); } catch (IOException e) { return fn + " cannot be used: " + e.getMessage(); }

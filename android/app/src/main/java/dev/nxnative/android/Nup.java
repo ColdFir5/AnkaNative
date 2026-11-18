@@ -24,10 +24,10 @@ import java.util.regex.Pattern;
  * Naming (NUP.md "Naming a package"): {@code <file>.nup:<selector>[/<path>]}, split at the last ".nup:", with the selector {@code base}, {@code update/<version>}
  * or {@code addon/<16 hex digits>}. {@link #parse} reads one, {@link #spec} writes one. No Android classes: the JVM test runs it on the Mac.
  */
-final class Nup {
+class Nup {
     static final int BASE = 0, UPDATE = 1, ADDON = 2;
     static final long NONE = 0xFFFFFFFFL;
-    static final String EXT = ".nup";
+    static final String EXT = ".nup", EXT_NX = ".nx";
 
     /** One package record */
     static final class Pkg {
@@ -57,7 +57,7 @@ final class Nup {
     }
 
     /** A directory or a file of the TOC */
-    static final class Node {
+    static class Node {
         final boolean dir;
         final long index;   // into dirs[] or files[]
         final String name;
@@ -84,7 +84,7 @@ final class Nup {
     final List<Pkg> packages;
     private final long offDir, offFile, offKids;
 
-    private Nup(File file, long fileSize, long tocOffset, long tocSize, long blobOffset, long dirCount, long fileCount, long poolOff, long poolSize, List<Pkg> packages) {
+    protected Nup(File file, long fileSize, long tocOffset, long tocSize, long blobOffset, long dirCount, long fileCount, long poolOff, long poolSize, List<Pkg> packages) {
         this.file = file;
         this.fileSize = fileSize;
         this.tocOffset = tocOffset;
@@ -100,17 +100,31 @@ final class Nup {
         offKids = offFile + 0x50 * fileCount;
     }
 
-    /** Whether a path is a .nup file by its name (ends with ".nup", lower case, as the host's and the tools' split at ".nup:" needs) */
-    static boolean isNup(File f) { return f != null && f.getName().endsWith(EXT) && f.getName().length() > EXT.length() && !f.isDirectory(); }
+    /** Whether a path is a .nup or .nx archive by its name (lower case, as the host's and the tools' split needs) */
+    static boolean isNup(File f) {
+        if (f == null || f.isDirectory()) return false;
+        String n = f.getName();
+        return n.endsWith(EXT) && n.length() > EXT.length() || n.endsWith(EXT_NX) && n.length() > EXT_NX.length();
+    }
 
-    /** A .nup named with another case of the extension: the tools and the host would not take it */
-    static boolean wrongCase(File f) { return f != null && !f.getName().endsWith(EXT) && f.getName().toLowerCase(Locale.ROOT).endsWith(EXT) && f.isFile(); }
+    /** Whether a path is specifically a .nx archive by its lower-case extension */
+    static boolean isNx(File f) { return f != null && f.getName().endsWith(EXT_NX) && f.getName().length() > EXT_NX.length() && !f.isDirectory(); }
+
+    /** A .nup or .nx named with another case of the extension: the tools and the host would not take it */
+    static boolean wrongCase(File f) {
+        if (f == null || !f.isFile()) return false;
+        String n = f.getName(), lo = n.toLowerCase(Locale.ROOT);
+        return !n.endsWith(EXT) && lo.endsWith(EXT) || !n.endsWith(EXT_NX) && lo.endsWith(EXT_NX);
+    }
+
+    /** ".nx" or ".nup" for messages, matching f's extension */
+    static String ext(File f) { return f != null && f.getName().toLowerCase(Locale.ROOT).endsWith(EXT_NX) ? EXT_NX : EXT; }
 
     // ---- Naming ----
 
     private static final Pattern SEL = Pattern.compile("(base|update/[0-9]+|addon/[0-9a-fA-F]{16})(/.*)?");
 
-    /** A parsed name: the .nup's path, its selector (null: none, the default package) and the path after it ("" when none; no leading '/') */
+    /** A parsed name: the archive's path, its selector (null: none, the default package) and the path after it ("" when none; no leading '/') */
     static final class Ref {
         final String path, selector, sub;
 
@@ -119,15 +133,21 @@ final class Nup {
         @Override public String toString() { return selector == null ? path : path + ":" + selector + (sub.isEmpty() ? "" : "/" + sub); }
     }
 
-    /** null when the name has no ".nup:" and does not end with ".nup"; IllegalArgumentException for a bad selector */
+    /** null when the name has no ".nup:" / ".nx:" and does not end with ".nup" / ".nx"; IllegalArgumentException for a bad selector */
     static Ref parse(String spec) {
         if (spec == null) return null;
-        int k = spec.lastIndexOf(EXT + ":");
-        if (k < 0) return spec.endsWith(EXT) && spec.length() > EXT.length() ? new Ref(spec, null, "") : null;
-        String path = spec.substring(0, k + EXT.length()), rest = spec.substring(k + EXT.length() + 1);
+        int kn = spec.lastIndexOf(EXT + ":"), kx = spec.lastIndexOf(EXT_NX + ":");
+        int k = Math.max(kn, kx);
+        if (k < 0) {
+            if (spec.endsWith(EXT) && spec.length() > EXT.length()) return new Ref(spec, null, "");
+            if (spec.endsWith(EXT_NX) && spec.length() > EXT_NX.length()) return new Ref(spec, null, "");
+            return null;
+        }
+        int extLen = k == kx ? EXT_NX.length() : EXT.length();
+        String path = spec.substring(0, k + extLen), rest = spec.substring(k + extLen + 1);
         if (rest.isEmpty()) return new Ref(path, null, "");
         Matcher m = SEL.matcher(rest);
-        if (!m.matches()) throw new IllegalArgumentException("not a package of a .nup: \"" + rest + "\" (base, update/<version> or addon/<16 hex digits>)");
+        if (!m.matches()) throw new IllegalArgumentException("not a package of an archive: \"" + rest + "\" (base, update/<version> or addon/<16 hex digits>)");
         String sel = m.group(1);
         if (sel.startsWith("addon/")) sel = sel.toLowerCase(Locale.ROOT);
         if (sel.startsWith("update/")) sel = "update/" + Long.parseLong(sel.substring(7));   // no leading zeros
@@ -170,6 +190,13 @@ final class Nup {
         if (!f.isFile()) throw new IOException(f + " is not a file");
         try (RandomAccessFile r = new RandomAccessFile(f, "r")) {
             long len = r.length();
+            if (len >= 4) {
+                byte[] magic = new byte[4];
+                r.readFully(magic);
+                if (magic[0] == 'N' && magic[1] == 'X' && magic[2] == 'A' && magic[3] == 'R') return Nx.read(f, verify);
+                if (f.getName().endsWith(EXT_NX) && len >= 4096 + 256) return Nx.read(f, verify);
+            }
+            r.seek(0);
             if (len < 0x80) throw new IOException(f.getName() + " is too short for a .nup");
             byte[] sb = new byte[0x80];
             r.readFully(sb);

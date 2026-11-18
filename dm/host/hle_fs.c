@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include "romfs_image.h"
 #include "nup_image.h"
+#include "nx_image.h"
 #include "save_sync.h"
 
 // Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
@@ -128,8 +129,17 @@ static int dm_fs_test_fail(const char *pt) {
 static int in_txn_dir(const char *hp) { return save_txn_from_path(hp); }
 static int rm_tree(const char *p);
 // Reads and checks a RomFS image's header and index; NULL (and a red line) when it is not a complete image. A NUP container package
-// ("<file>.nup[:<selector>]", nup_image.h, android/NUP.md) opens as an image too
+// ("<file>.nup[:<selector>]", nup_image.h, android/NUP.md) or NX snapshot ("<file>.nx[:<selector>]", nx_image.h, android/NX.md) opens as an image too
 static romfs_img *img_open(const char *path) {
+    if (nx_is_spec(path)) {
+        char why[256] = ""; romfs_img *m = nx_image_open(path, why, sizeof why);
+        if (m) {
+            const nx_aux *a = m->aux;
+            LOG("fs NX %s: %llu entries, %llu files, %u blocks (%u raw, %u zstd), cache %llu MiB", path, (unsigned long long)m->n,
+                (unsigned long long)a->nfiles, a->nblocks, a->nraw, a->nzstd, (unsigned long long)(a->budget >> 20));
+        } else LOG("[RED] fs NX %s: %s (errno=%d)", path, why, errno);
+        return m;
+    }
     if (nup_is_spec(path)) {
         char why[256] = ""; romfs_img *m = nup_image_open(path, why, sizeof why);
         if (m) LOG("fs NUP %s: %llu entries, %llu compressed files (decompressed when opened, cache %llu MiB)", path, (unsigned long long)m->n,
@@ -234,7 +244,8 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     if (ro && !txn) {   // game files: a RomFS folder, or a RomFS image file in its place
         // A path that is neither is a stale or mistyped one (an old run command still naming the RomFS folder a rebuild replaced with RomFS.img): stop here, not at the game's
         // first failed read (Echoes of Wisdom crashed 0.3 s after nnMain, GitHub issue #615). Add-on content and system data check their own paths before they mount
-        if (nup_is_spec(dir)) { if (!(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s (%s:) cannot be used as a NUP package (the log line above says why)", dir, name); }
+        if (nx_is_spec(dir)) { if (!(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s (%s:) cannot be used as an NX snapshot (the log line above says why)", dir, name); }
+        else if (nup_is_spec(dir)) { if (!(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s (%s:) cannot be used as a NUP package (the log line above says why)", dir, name); }
         else if (stat(dir, &ist) || !(S_ISDIR(ist.st_mode) || S_ISREG(ist.st_mode)))
             die("the game files %s (%s:) are missing: neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name);
         else if (S_ISREG(ist.st_mode) && !(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
@@ -480,7 +491,7 @@ static void romfs_tables(const char *dir, size_t *ndir, size_t *dbytes, size_t *
 static size_t romfs_work_size(const char *dir) {
     size_t ndir = 1, dbytes = 0x18, nfile = 0, fbytes = 0;   // the root directory has an entry with an empty name
     struct stat st;
-    if (nup_is_spec(dir) || (!stat(dir, &st) && S_ISREG(st.st_mode))) {
+    if (nx_is_spec(dir) || nup_is_spec(dir) || (!stat(dir, &st) && S_ISREG(st.st_mode))) {
         romfs_img *m = img_open(dir);
         if (!m) return 0x1000;
         for (uint64_t k = 1; k < m->n; k++) {
@@ -494,7 +505,9 @@ static size_t romfs_work_size(const char *dir) {
 }
 static int aoc_dir(char *dir, size_t n, int index) {
     const char *base = getenv("DM_AOC_DIR"); struct stat st;
-    // <index>.nup: a NUP container (or a link to one) holding the add-on as an addon package; the mount picks it by index (nup_image.h "aoc/<index>")
+    // <index>.nx / <index>.nup: a container (or a link to one) holding the add-on as an addon snapshot/package; the mount picks it by index
+    if (base && *base && snprintf(dir, n, "%s/%d.nx", base, index) < (int)n && !stat(dir, &st) && S_ISREG(st.st_mode))
+        return snprintf(dir, n, "%s/%d.nx:aoc/%d", base, index, index) < (int)n;
     if (base && *base && snprintf(dir, n, "%s/%d.nup", base, index) < (int)n && !stat(dir, &st) && S_ISREG(st.st_mode))
         return snprintf(dir, n, "%s/%d.nup:aoc/%d", base, index, index) < (int)n;
     if (base && *base && snprintf(dir, n, "%s/%d.img", base, index) < (int)n && !stat(dir, &st) && S_ISREG(st.st_mode)) return 1;
@@ -794,6 +807,13 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         const img_ent *x = &g_mnt[IMG_M(h)].img->e[IMG_K(h)];
         fd = g_mnt[IMG_M(h)].img->fd; base = (int64_t)x->a;
         sz = off < 0 || (uint64_t)off >= x->b ? 0 : (size_t)(x->b - off) < sz ? (size_t)(x->b - off) : sz;
+        if (x->flags & IMG_ENT_NX) {
+            romfs_img *m = g_mnt[IMG_M(h)].img; uint64_t fst0 = now_ns(); size_t nxgot = 0;
+            dm_guest_write_prepare(buf, sz);
+            if (!nx_read(m, x, (uint64_t)off, buf, sz, &nxgot)) return RES_FAIL;
+            *out = nxgot; fs_stat_note(1, fst0, nxgot);
+            return RES_OK;
+        }
         if (x->flags & IMG_ENT_ZSTD) {   // a compressed NUP file: its decompressed bytes, held by the open (one more reference for this read, in case the game reads a closed handle)
             romfs_img *m = g_mnt[IMG_M(h)].img; char why[200] = ""; uint64_t f0 = now_ns();
             const uint8_t *src = nup_z_get(m, x->a, why, sizeof why);

@@ -39,6 +39,12 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
     static ret cname(__VA_ARGS__)
 // Same as above, but the implementation runs on this thread's big host stack (hle_bigstack.c): what is registered is a stub generated at compile time (the implementation's address goes into x16, then a jump to dm_bigstack_enter).
 // For take-overs with large stack use (the file system sizes its buffers by PATH_MAX): a game thread's stack can be as small as 8 KB. Only register arguments are carried over (<= 8 integer, <= 8 floating point); not for variadic functions
+#ifdef DM_TEST_LINUX
+#define HLE_FORCE_BIG(mangled, why, ret, cname, ...)                                               \
+    static ret cname(__VA_ARGS__);                                                                \
+    PLAT_TABLE(swforce) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
+    static ret cname(__VA_ARGS__)
+#else
 #define HLE_FORCE_BIG(mangled, why, ret, cname, ...)                                               \
     static ret cname(__VA_ARGS__) __attribute__((used));                                          \
     extern const char cname##_bs[];                                                               \
@@ -46,6 +52,7 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
             "    adrp x16, " PLAT_ASM_PAGE(cname) "\n    add x16, x16, " PLAT_ASM_PAGEOFF(cname) "\n    b " PLAT_ASM_SYM(dm_bigstack_enter) "\n"); \
     PLAT_TABLE(swforce) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why}; \
     static ret cname(__VA_ARGS__)
+#endif
 // The game's call site inside a HLE_FORCE_BIG implementation: pass __builtin_return_address(0), which after a stack switch is the entry's own (hle_bigstack.c)
 void *dm_bigstack_caller(void *ra);
 

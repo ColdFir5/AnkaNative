@@ -22,6 +22,12 @@
 #define PLAT_ANDROID 1
 #define PLAT_MAC 0
 #define PLAT_IOS 0
+#elif defined(DM_TEST_LINUX)
+#include <ucontext.h>
+#define PLAT_APPLE 0
+#define PLAT_ANDROID 0
+#define PLAT_MAC 0
+#define PLAT_IOS 0
 #else
 #error "the host runs on Apple platforms or Android arm64"
 #endif
@@ -170,6 +176,7 @@ PLAT_FN void plat_on_signal(int sig, void (*fn)(void *), void *ctx);       // fn
 #define PLAT_UC_FPCR(uc) ((uc)->uc_mcontext->__ns.__fpcr)
 #define PLAT_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
 #else
+#if PLAT_ANDROID
 #include <asm/sigcontext.h>
 struct fpsimd_context *plat_uc_fpsimd(ucontext_t *uc);
 uint64_t plat_uc_esr(ucontext_t *uc);
@@ -183,6 +190,7 @@ uint64_t plat_uc_esr(ucontext_t *uc);
 #define PLAT_UC_FPSR(uc) (plat_uc_fpsimd(uc)->fpsr)
 #define PLAT_UC_FPCR(uc) (plat_uc_fpsimd(uc)->fpcr)
 #define PLAT_UC_ESR(uc) plat_uc_esr(uc)
+#endif
 #endif
 
 // ---- Files ----

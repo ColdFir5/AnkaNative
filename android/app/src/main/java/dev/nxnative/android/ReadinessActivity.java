@@ -318,7 +318,7 @@ public final class ReadinessActivity extends Activity {
                 Nup n = Nup.open(f);
                 StringBuilder s = new StringBuilder();
                 for (Nup.Pkg p : n.packages) s.append(s.length() == 0 ? "" : ", ").append(p.selector() != null ? p.selector() : "kind " + p.kind);
-                return new Readiness.Check("Game files", Readiness.Status.PASS, f + ": a .nup that reads and checks (" + s + ").", null);
+                return new Readiness.Check("Game files", Readiness.Status.PASS, f + ": a " + Nup.ext(f) + " that reads and checks (" + s + ").", null);
             } catch (IOException e) {
                 return new Readiness.Check("Game files", Readiness.Status.FAIL, f + " cannot be used: " + e.getMessage(), f.canRead() ? null : "access");
             }

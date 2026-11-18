@@ -348,8 +348,8 @@ public final class MainActivity extends Activity {
         TextView h = Ui.heading(this, "Add your game");
         h.setGravity(Gravity.CENTER);
         Ui.add(c, h, 12, Ui.wrap());
-        TextView t = Ui.small(this, Ondevice.available() ? "Pick your dump folder, the one with base/ (and updates/), or your game's .nup file."
-                : "Prepare the game once on a computer (the README's Install steps), copy the pack next to the dump, then pick your dump folder or .nup file.");
+        TextView t = Ui.small(this, Ondevice.available() ? "Pick your dump folder, the one with base/ (and updates/), or your game's .nup or .nx file."
+                : "Prepare the game once on a computer (the README's Install steps), copy the pack next to the dump, then pick your dump folder, .nup or .nx file.");
         t.setGravity(Gravity.CENTER);
         Ui.add(c, t, 6, Ui.wrap());
         LinearLayout steps = Ui.row(this);
@@ -506,7 +506,8 @@ public final class MainActivity extends Activity {
         if (noProfile == null)
             Ui.add(box, new Ui.Setting(this, "📲", "Import pack…", v -> { d[0].dismiss(); PackUi.importPick(this, g); }).value("A .zip or a pack folder").chevron(this).view, 0);
         Ui.add(box, new Ui.Setting(this, "📨", "Share log", v -> { d[0].dismiss(); shareLog(g.titleId); }).chevron(this).view, 0);
-        TextView info = Ui.small(this, "Title ID: " + g.titleId + "\nGame: " + g.gameDir + (Nup.isNup(new File(g.gameDir)) ? " (.nup)" : "") + "\nPack: " + g.packDir
+        File gd = new File(g.gameDir);
+        TextView info = Ui.small(this, "Title ID: " + g.titleId + "\nGame: " + g.gameDir + (Nup.isNup(gd) ? " (" + Nup.ext(gd) + ")" : "") + "\nPack: " + g.packDir
                 + "\nShaders: " + (lp == null ? "present (" + BuildConfig.NX_DMSH_VK_CHAIN + ")" : lp) + "\nSaves: " + (save != null ? save.getPath() : "not set"));
         info.setTextIsSelectable(true);
         info.setTextSize(12);
@@ -543,16 +544,16 @@ public final class MainActivity extends Activity {
     void addGame() {
         if (needAccess()) return;
         new AlertDialog.Builder(this).setTitle("Add game: your dump is…")
-                .setItems(new String[] {"A folder (with base/, and updates/ if any)", "A .nup file"}, (d, w) -> {
+                .setItems(new String[] {"A folder (with base/, and updates/ if any)", "A .nup or .nx file"}, (d, w) -> {
                     if (w == 0) pickFolder(PICK_GAME, "Pick your dump folder (with base/, and updates/ if any)");
                     else pickNup();
                 })
                 .setNegativeButton("Cancel", null).show();
     }
 
-    /** The system file picker for a .nup; its document is turned into its /storage path (PathUtil.documentToPath), as a picked folder is */
+    /** The system file picker for a .nup or .nx; its document is turned into its /storage path (PathUtil.documentToPath), as a picked folder is */
     private void pickNup() {
-        Toast.makeText(this, "Pick your game's .nup file", Toast.LENGTH_LONG).show();
+        Toast.makeText(this, "Pick your game's .nup or .nx file", Toast.LENGTH_LONG).show();
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
         i.putExtra(DocumentsContract.EXTRA_INITIAL_URI, Uri.parse("content://com.android.externalstorage.documents/document/primary%3A"));
         startActivityForResult(i, PICK_NUP);
@@ -596,15 +597,15 @@ public final class MainActivity extends Activity {
         List<File> found = PackFind.gamesIn(game);
         if (found.size() == 1) { gamePicked(found.get(0)); return; }
         if (found.isEmpty()) {
-            error(game + " has no main.npdm (base/exefs/, updates/<version>/exefs/ or exefs/), no .nup file and no game folder in it. Pick the game's own folder, its .nup file, or the folder that holds your games.");
+            error(game + " has no main.npdm (base/exefs/, updates/<version>/exefs/ or exefs/), no .nup or .nx file and no game folder in it. Pick the game's own folder, its .nup or .nx file, or the folder that holds your games.");
             return;
         }
         addAll(found, false);
     }
 
-    /** A single .nup (NUP.md): its name and access checked here, the rest as every game (addAll) */
+    /** A single .nup or .nx (NUP.md / NX.md): its name and access checked here, the rest as every game (addAll) */
     private void nupPicked(File nup) {
-        if (Nup.wrongCase(nup)) { error(nup.getName() + ": rename it so that its name ends in \".nup\" (lower case); the game and the tools read only that name."); return; }
+        if (Nup.wrongCase(nup)) { error(nup.getName() + ": rename it so that its name ends in \"" + Nup.ext(nup) + "\" (lower case); the game and the tools read only that name."); return; }
         if (!nup.canRead()) { error(nup + " cannot be read. Check that All files access is on."); return; }
         addAll(List.of(nup), true);
     }
@@ -640,7 +641,7 @@ public final class MainActivity extends Activity {
             for (File g : picked) {
                 Pick k = new Pick(g);
                 out.add(k);
-                if (Nup.wrongCase(g)) { k.error = g.getName() + ": rename it so that its name ends in \".nup\" (lower case)."; continue; }
+                if (Nup.wrongCase(g)) { k.error = g.getName() + ": rename it so that its name ends in \"" + Nup.ext(g) + "\" (lower case)."; continue; }
                 try { k.id = Pack.titleIdOf(g); } catch (IOException e) { k.error = e.getMessage(); continue; }
                 String why = Profile.missing(k.id, single ? "This game" : g.getName());
                 if (why != null) { k.unsupported = true; k.error = why; continue; }
@@ -678,7 +679,7 @@ public final class MainActivity extends Activity {
                 }   // a dump of a supported build: Prepare makes its pack
                 pendingGame = k.game;
                 pendingId = k.id;
-                String what = Nup.isNup(k.game) ? ".nup" : "folder";
+                String what = Nup.isNup(k.game) ? Nup.ext(k.game) : "folder";
                 // Why Prepare cannot start from it (another build than this app's, an incomplete dump), plainly; a pack made elsewhere can still be picked
                 String why = k.found != null && k.found.error != null ? k.found.error
                         : !Ondevice.available() ? "No pack found for this " + what + ". " + Ondevice.UNAVAILABLE
@@ -798,7 +799,7 @@ public final class MainActivity extends Activity {
     private String add(File game, String id, File packDir, List<String> replace) {
         Pack pack;
         try { pack = Pack.read(packDir); } catch (IOException e) { return e.getMessage(); }
-        if (!pack.titleId.equals(id)) return "The pack is for " + pack.titleId + ", the game " + (Nup.isNup(game) ? ".nup" : "folder") + " holds " + id + ".";
+        if (!pack.titleId.equals(id)) return "The pack is for " + pack.titleId + ", the game " + (Nup.isNup(game) ? Nup.ext(game) : "folder") + " holds " + id + ".";
         String why = Profile.missing(id, pack.name.isEmpty() ? null : pack.name);
         if (why != null) return why;
         if (Nup.isNup(game)) {

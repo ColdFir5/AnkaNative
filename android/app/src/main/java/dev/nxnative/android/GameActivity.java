@@ -480,7 +480,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             hostRunning = true;
             if (heldSurface != null) surface(heldSurface);   // a surface that came before the start (surface())
             if (readinessLine != null) Native.note(readinessLine + (triedAnyway ? "; the player chose Try anyway" : ""));   // the readiness check (readinessHold)
-            Native.note("[nxlaunch] game: " + game + (Nup.isNup(game) ? " (.nup)" : " (folder)") + ", DM_ROMFS " + romfs + ", pack " + packDir);
+            Native.note("[nxlaunch] game: " + game + (Nup.isNup(game) ? " (" + Nup.ext(game) + ")" : " (folder)") + ", DM_ROMFS " + romfs + ", pack " + packDir);
             Native.note("[nxlaunch] save: " + save + " (" + saveHow + ")" + (saveNote != null ? "; " + saveNote : ""));
             Native.note("Anka Native " + BuildConfig.VERSION_NAME + " (" + BuildConfig.NX_COMMIT + "), host libnxhost_" + id + ".so; " + name + " " + id + " version " + pack.version);
             Native.note("device " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (SDK " + Build.VERSION.SDK_INT + "), " + Build.SUPPORTED_ABIS[0]

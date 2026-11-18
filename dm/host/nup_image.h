@@ -31,6 +31,8 @@
 // zstd's decompressor (dm/third_party/zstd/zstddeclib.c): DM_NUP_ZSTD is defined where it is linked (the Android host, android/host/CMakeLists.txt,
 // and the unit tests). Without it (the Mac and iOS hosts) a compressed file fails to open with a red line (nup_z_get); raw files read as usual
 #ifdef DM_NUP_ZSTD
+#ifndef DM_ZSTD_DECLARED
+#define DM_ZSTD_DECLARED
 size_t ZSTD_decompress(void *dst, size_t dst_cap, const void *src, size_t src_size);
 unsigned ZSTD_isError(size_t code);
 const char *ZSTD_getErrorName(size_t code);
@@ -40,6 +42,7 @@ typedef struct ZSTD_outBuffer_s { void *dst; size_t size; size_t pos; } ZSTD_out
 ZSTD_DStream *ZSTD_createDStream(void);
 size_t ZSTD_freeDStream(ZSTD_DStream *zds);
 size_t ZSTD_decompressStream(ZSTD_DStream *zds, ZSTD_outBuffer *output, ZSTD_inBuffer *input);
+#endif
 #endif
 #include <sys/mman.h>
 #include <time.h>

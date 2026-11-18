@@ -287,13 +287,18 @@ public final class BuildConfig {
         t = Path(tempfile.mkdtemp(prefix='nupjvm_'))
         try:
             (t / 'BuildConfig.java').write_text(self.STUB)
-            subprocess.run(['javac', '-d', str(t / 'classes')] + [str(src / f'{c}.java') for c in ('Nup', 'Zstd', 'Pack', 'DumpLayout', 'BuildCheck', 'RomfsCheck', 'Profile', 'ShaderLibs')]
-                           + [str(REPO / 'android/app/src/jvmtest/java/dev/nxnative/android/NupJvmTest.java'), str(t / 'BuildConfig.java')], check=True, capture_output=True, text=True)
+            subprocess.run(['javac', '-d', str(t / 'classes')] + [str(src / f'{c}.java') for c in ('Nup', 'Nx', 'Zstd', 'Pack', 'DumpLayout', 'BuildCheck', 'RomfsCheck', 'Profile', 'ShaderLibs')]
+                           + [str(REPO / 'android/app/src/jvmtest/java/dev/nxnative/android/NupJvmTest.java'),
+                              str(REPO / 'android/app/src/jvmtest/java/dev/nxnative/android/NxJvmTest.java'), str(t / 'BuildConfig.java')], check=True, capture_output=True, text=True)
             (t / 'run').mkdir()
             r = subprocess.run(['java', '-cp', str(t / 'classes'), 'dev.nxnative.android.NupJvmTest', str(REPO), str(t / 'run')] + ([sys.executable] if have_zstd() else []),
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-2000:])
             self.assertRegex(r.stdout, r'^ok \d+')
+            r2 = subprocess.run(['java', '-cp', str(t / 'classes'), 'dev.nxnative.android.NxJvmTest', str(t / 'run')],
+                                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 0, r2.stdout[-2000:] + r2.stderr[-2000:])
+            self.assertRegex(r2.stdout, r'^ok \d+')
         finally: shutil.rmtree(t, ignore_errors=True)
 
 

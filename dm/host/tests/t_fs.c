@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <signal.h>
+#ifdef __APPLE__
 #include <sys/clonefile.h>                // declared before the define, so only hle_fs.c's calls go to the fake
 static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off);
 static int fake_clonefile(const char *src, const char *dst, uint32_t flags);
@@ -27,10 +28,14 @@ static int fake_clonefile(const char *src, const char *dst, uint32_t flags) {
     if (g_clone_enotsup) { errno = ENOTSUP; return -1; }
     return clonefile(src, dst, flags);
 }
+#else
+#include "../hle_fs.c"
+#endif
 
 struct dm_flags g_flag; uint64_t g_t0_ns; uint64_t now_ns(void) { return 0; }   // stubs for log timestamps and the read path (not used by the write path)
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
 extern int g_nfail, g_lasterr;                                        // front-end notification count (the strong implementation in t_fs_stub.c replaces the weak one in hle_fs.c)
+#ifdef __APPLE__
 static int g_mode, g_calls;                   // 0 write normally; 1 always return 0; 2 write only 3 bytes the first time
 static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off) {
     g_calls++;
@@ -38,6 +43,7 @@ static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off) {
     if (g_mode == 2 && g_calls == 1 && n > 3) n = 3;
     return pwrite(fd, buf, n, off);
 }
+#endif
 static int fails, checks;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("  ✗ "); } else printf("  ✓ "); printf(__VA_ARGS__); printf("\n"); } while (0)
 static void put(const char *p, const char *s) { FILE *f = fopen(p, "w"); fputs(s, f); fclose(f); }
@@ -185,7 +191,7 @@ int main(void) {
         const char *paths[2] = {gone, fifo};
         for (int i = 0; i < 2; i++) {
             fflush(NULL); pid_t pid = fork();
-            if (!pid) { freopen(out, "w", stderr); setenv("DM_ROMFS", paths[i], 1); h_fs_MountRom("rom", NULL, 0); _exit(0); }
+            if (!pid) { freopen(out, "w", stderr); setvbuf(stderr, NULL, _IONBF, 0); setenv("DM_ROMFS", paths[i], 1); h_fs_MountRom("rom", NULL, 0); _exit(0); }
             int st = 0; waitpid(pid, &st, 0);
             char line[512] = {0}; FILE *f = fopen(out, "r"); if (f) { fread(line, 1, sizeof line - 1, f); fclose(f); }
             CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT && strstr(line, "FATAL the game files") && strstr(line, paths[i]), "%s game files stop the rom mount", i ? "a fifo as the" : "missing");
@@ -253,6 +259,7 @@ int main(void) {
         CHECK(!img_open(ip), "a cut-off image is refused");
     }
     nup_tests(root);
+#ifdef __APPLE__
     snprintf(save, sizeof save, "%s/save", root); snprintf(work, sizeof work, "%s.work", save);
     mkdir(save, 0755); snprintf(p, sizeof p, "%s/a", save); put(p, "old");
     setenv("DM_SAVE", save, 1); setenv("DM_TEST_FS_FAIL", "write:5:28", 1);   // the 5th save write fails, errno 28 = ENOSPC
@@ -363,6 +370,7 @@ int main(void) {
         snprintf(lnk, sizeof lnk, "%s/lnk2", root); symlink(victim, lnk); errno = 0;
         CHECK(rm_tree(lnk) == -1 && errno == ENOTDIR && same(vf, "keep"), "rm_tree of a symlink to a directory refuses it (ENOTDIR) and leaves the target alone");
     }
+#endif
 
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); system(cmd);
     printf("== %d checks, %d failed ==\n", checks, fails);

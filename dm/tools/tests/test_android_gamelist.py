@@ -43,7 +43,7 @@ class GameListJvm(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp(prefix='gamelist_'))
         (cls.tmp / 'stub').mkdir()
         (cls.tmp / 'stub/BuildConfig.java').write_text(STUB)
-        srcs = [SRC / f'{n}.java' for n in ('BuildCheck', 'DumpLayout', 'RomfsCheck', 'GameList', 'Frontend', 'Nup', 'Zstd', 'Pack', 'Profile', 'ShaderLibs')]
+        srcs = [SRC / f'{n}.java' for n in ('BuildCheck', 'DumpLayout', 'RomfsCheck', 'GameList', 'Frontend', 'Nup', 'Nx', 'Zstd', 'Pack', 'Profile', 'ShaderLibs')]
         r = subprocess.run(['javac', '-Xlint:all,-try', '-Werror', '-d', str(cls.tmp / 'classes'), *map(str, srcs), str(TEST), str(cls.tmp / 'stub/BuildConfig.java')],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr

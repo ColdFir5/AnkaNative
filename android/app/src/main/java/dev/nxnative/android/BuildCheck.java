@@ -158,7 +158,7 @@ final class BuildCheck {
             Mod nso = mod(game, gv, e.getKey());
             if (nso.error != null) return new Result(Kind.UNREADABLE, nso.error, nso.label + ": " + nso.error);
             if (!nso.exists())
-                return new Result(Kind.MISSING, "The pack is for " + name + " " + Profile.versionName(parse(p.version)) + ", but the game " + (nso.nup != null ? ".nup" : "folder")
+                return new Result(Kind.MISSING, "The pack is for " + name + " " + Profile.versionName(parse(p.version)) + ", but the game " + (nso.nup != null ? Nup.ext(game) : "folder")
                         + " has no " + nso.label + ". Pick the dump that has that update, or Prepare again from this one.", "no " + nso.label + " (pack version " + p.version + ")");
             String id;
             try {
@@ -174,7 +174,7 @@ final class BuildCheck {
         }
         if (firstMod != null)
             return new Result(Kind.OTHER_BUILD, "The pack was made from another build of " + name + " (" + firstMod + " " + shortId(firstWant) + "…) than the one in the game "
-                    + (Nup.isNup(game) ? ".nup" : "folder") + " (" + shortId(firstHave) + "…, " + Profile.versionName(parse(p.version))
+                    + (Nup.isNup(game) ? Nup.ext(game) : "folder") + " (" + shortId(firstHave) + "…, " + Profile.versionName(parse(p.version))
                     + "). Its code would crash with this game: Prepare again makes a pack from this dump.\n\nBuild IDs that differ: " + diff, diff.toString());
         Profile prof = Profile.of(p.titleId);
         Map<Long, Map<String, String>> sup = prof == null ? Map.of() : prof.buildMap();

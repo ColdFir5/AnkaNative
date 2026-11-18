@@ -328,7 +328,7 @@ final class Pack {
                     // not a .nup name: the game's own
                 }
             }
-            out.put(e.getKey() + ".nup", target.getPath());
+            out.put(e.getKey() + Nup.ext(target), target.getPath());
         }
         return out;
     }
