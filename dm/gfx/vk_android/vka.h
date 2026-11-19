@@ -296,6 +296,8 @@ typedef struct vka_img {
     // frame it was made in, rl_wf / rl_sf the frames of its last GPU write and last binding for sampling (0: none), rl_off its storage's offset in its pool, rl_path what made it
     uint64_t rl_off; uint32_t rl_seq, rl_mf, rl_wf, rl_sf; uint8_t rl_path;
     uint8_t ra_fresh;        // guest-aliased (m.a, vka_tex.c "Guest-aliased targets"): its allocation was made for it, so its first use clears it (nothing else is bound there yet)
+    struct vka_img *bshad;   // lazy uncompressed shadow for drawing into a compressed image through a size-compatible view (DM_VK_BLOCK_RT, vka_tex.c)
+    uint8_t bshad_fail;      // creating bshad failed: do not retry
 } vka_img;
 // What asks for a texture's image (DM_VK_RTLOG_MB's `path`), set around vka_tex_get by its callers that are not a binding or a table: a render pass attachment, a clear, a copy
 enum { VKA_RL_ATT = 1, VKA_RL_CLEAR, VKA_RL_COPY };
@@ -328,6 +330,9 @@ void vka_img_written_at(vka_img *im, const char *file, int line);
 // Call it before taking a view of im for the write. Any thread that records (takes the table lock); no render pass may be open in cb unless upload batches are on
 void vka_tex_own(vka_img *im, VkCommandBuffer cb);
 void vka_tex_whole(vka_img *im, VkCommandBuffer cb);   // a copy source that mip drop left without its finer levels (vka_tex.c "Mip drop"): whole again first
+int vka_block_rt_on(void);                              // DM_VK_BLOCK_RT (restart-only, default 1): render into compressed images through an uncompressed shadow
+vka_img *vka_tex_block_shadow(vka_img *im, const vka_fmt *vf, uint32_t lv, uint32_t l0, uint32_t nl, VkCommandBuffer cb, uint32_t *slv, uint32_t *sw, uint32_t *shh);
+void vka_tex_block_copy(VkCommandBuffer cb, const vka_img *src, uint32_t slv, const vka_img *dst, uint32_t dlv, uint32_t l0, uint32_t nl, uint32_t w, uint32_t h);
 void vka_tex_big_stats(char *b, size_t n);           // the largest images the GPU has not written, with what sampled them and what lies over their storage (DM_VK_BIGIMG_MB)
 int vka_rp_is_open(void);                            // a render pass is open in the replay's command buffer (vka_draw.c)
 void vka_tex_writeback(VkCommandBuffer cb);   // mtl_sub_commit, after the last pass
@@ -494,9 +499,10 @@ int vka_pass_keep(void);                             // DM_VK_PASS_KEEP=0: a SET
 int vka_rp_open_for(const p_set_rt *rt, int has_rt);   // a pass is open over these targets
 int vka_rp_game_barrier(uint32_t bits);                // a game barrier (OP_BARRIER): 1 = taken inside the open pass (DM_VK_BAR_KEEP), 0 = the caller ends the pass and records a full barrier
 void vka_rp_bar_stats(char *b, size_t n, double frames);
+void vka_rp_drop_stats(char *b, size_t n, double frames);
 void vka_rp_prep_clear(const p_set_rt *rt, int has_rt); // before a clear of these targets: a pass or pending clears of other targets end
 // A clear of a bound target: everything the clear outside a pass needs (vka_clear_outside, vka_exec.c), and the value for the attachment inside one
-typedef struct { int ci; vka_img *im; VkFormat fmt; VkImageAspectFlags asp; uint32_t lv, l0, nl; VkRect2D rc; int whole; VkClearValue out, in; } vka_pclear;
+typedef struct { int ci; vka_img *im; VkFormat fmt; VkImageAspectFlags asp; uint32_t lv, l0, nl; VkRect2D rc; int whole; VkClearValue out, in; vka_img *bdst; uint32_t dlv; } vka_pclear;
 void vka_clear_outside(const vka_pclear *c);         // the clear on the image, outside any pass, then a barrier
 // A clear of bound target c->ci (< 0: depth / stencil) into the render pass over those targets: an open one takes it as vkCmdClearAttachments; with none open it waits for
 // the next draw's pass (loadOp CLEAR), or is done outside when anything else comes first (vka_rp_end). 0 = not taken: the caller ends the pass and clears outside

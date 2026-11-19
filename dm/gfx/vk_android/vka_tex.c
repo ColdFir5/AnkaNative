@@ -176,7 +176,7 @@ static uint64_t g_img_made;   // (under g_tmu) image memory allocated in all (im
 uint64_t vka_tex_mem_nolock(int *n) { if (n) *n = g_nlive; return g_img_bytes + vka_imem_zbytes_nolock() + vka_imem_abytes_nolock(); }   // (zero-shared and guest-aliased allocations counted once each)
 uint64_t vka_tex_mem(int *n, uint64_t *gpu_written) {
     pthread_mutex_lock(&g_tmu); uint64_t all = g_img_bytes + vka_imem_zbytes() + vka_imem_abytes(), gw = 0;
-    for (int i = 0; i < g_nlive; i++) if (g_live[i]->gpu_owned) gw += g_live[i]->bytes;
+    for (int i = 0; i < g_nlive; i++) if (g_live[i]->gpu_owned) gw += g_live[i]->bytes + (g_live[i]->bshad ? g_live[i]->bshad->bytes : 0);
     if (n) *n = g_nlive; if (gpu_written) *gpu_written = gw;
     pthread_mutex_unlock(&g_tmu); return all;
 }
@@ -191,7 +191,7 @@ void vka_tex_alias_stats(char *b, size_t n) {
     for (int i = 0; i < g_nlive; i++) { const vka_img *im = g_live[i];
         if (im->pdead) { dead += im->bytes; ndead++; }
         for (int k = 0; k < 2; k++) if (now - im->used_s >= (k ? 60u : 10u)) { idle[k] += im->bytes; nidle[k]++; }   // (the flag as last checked: img_pool_dead is not called here)
-        if (im->gpu_owned) { gw += im->bytes; continue; }
+        if (im->gpu_owned) { gw += im->bytes + (im->bshad ? im->bshad->bytes : 0); continue; }
         int m = im->mode < 3 ? im->mode : 0; by[m][0] += im->bytes; cnt[m]++; if (im->pool_fit) by[m][1] += im->bytes; st += im->L.size; }
     uint64_t evb = g_ev_bytes, evn = g_ev_n, evr = g_ev_remade;   // (image eviction, tex_evict)
     pthread_mutex_unlock(&g_tmu);
@@ -236,6 +236,7 @@ static int cpuw_take(uint64_t s, int add) {   // add: insert; else: remove and s
 static void img_destroy(void *arg) {
     vka_img *im = arg;
     if (im->zold) { img_destroy(im->zold); im->zold = NULL; }   // (the zero-shared image it left: no holder is left either)
+    if (im->bshad) { img_destroy(im->bshad); im->bshad = NULL; }   // (lazy block-RT shadow lives as long as im)
     for (view_ent *v = im->views, *n; v; v = n) { n = v->next; vk.vkDestroyImageView(V.dev, v->v, NULL); free(v); }
     if (im->rs) { vks_free(im->rs); vks_va_give(im->va); }   // (its binds dropped or run first)
     if (im->img) vk.vkDestroyImage(V.dev, im->img, NULL);
@@ -255,7 +256,7 @@ static void unref_locked(vka_img *im) {
     for (int i = 0; i < g_nlive; i++) if (g_live[i] == im) { g_live[i] = g_live[--g_nlive]; break; }
     for (int i = 0; i < g_nbig; i++) if (g_big[i] == im) { g_big[i] = g_big[--g_nbig]; break; }
     rtw_forget(im); rl_note(im, "gone");
-    g_img_bytes -= im->bytes;
+    g_img_bytes -= im->bytes + (im->bshad ? im->bshad->bytes : 0);
     vka_after(vka_fence_last(), img_destroy, im);
 }
 
@@ -1424,6 +1425,89 @@ void vka_tex_own(vka_img *im, VkCommandBuffer cb) {
     if (md) nvn_pool_use(0);
 }
 
+// ---------- Uncompressed shadow for drawing into block-compressed targets (DM_VK_BLOCK_RT) ----------
+// GPU block encoders (e.g. OoT's 3D BC4 volume encoded slice-by-slice through an R16G16B16A16_UINT view) render into a compressed texture through a size-compatible
+// uncompressed colour view. Rather than remaking the compressed image with BLOCK_TEXEL_VIEW_COMPATIBLE_BIT (which forbids layered views and disables UBWC/linear-fallback),
+// we lazily allocate an uncompressed shadow at the block grid (ceil(w/bw) x ceil(h/bh) x depth, same imageType, 2D_ARRAY_COMPATIBLE for 3D, MUTABLE_FORMAT for any
+// size-compatible uncompressed view), render into it, and vkCmdCopyImage the written region back into the compressed image when the pass ends (vka_tex_block_copy).
+int vka_block_rt_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) { v = VKA_ENV("DM_VK_BLOCK_RT", 1) != 0; atomic_store_explicit(&on, v, memory_order_relaxed); }
+    return v;
+}
+vka_img *vka_tex_block_shadow(vka_img *im, const vka_fmt *vf, uint32_t lv, uint32_t l0, uint32_t nl, VkCommandBuffer cb, uint32_t *slv, uint32_t *sw, uint32_t *shh) {
+    if (!vka_block_rt_on() || !im || !vf || !cb) return NULL;
+    if (!compressed(&im->f) || compressed(vf) || vf->kind >= 3 || vf->bpb != im->f.bpb || im->samples != 1 || !(im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return NULL;
+    if (!(feats(vf->view) & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) || !(feats(vf->vk) & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) return NULL;
+    if (lv >= im->levels || !nl) return NULL;
+    int is3d = im->d.target == NVN_TEXTURE_TARGET_3D;
+    uint32_t mw = im->w >> lv ? im->w >> lv : 1, mh = im->h >> lv ? im->h >> lv : 1;
+    uint32_t bw_lv = (mw + im->f.bw - 1) / im->f.bw, bh_lv = (mh + im->f.bh - 1) / im->f.bh;
+    uint32_t w0 = (im->w + im->f.bw - 1) / im->f.bw, h0 = (im->h + im->f.bh - 1) / im->f.bh;
+    if (!im->bshad) {
+        if (im->bshad_fail) return NULL;
+        if (cb == vka_rp_cb() && vka_rp_is_open()) vka_rp_end();
+        vka_img *sh = calloc(1, sizeof *sh);
+        sh->serial = im->serial; sh->d = im->d; sh->f = *vf; sh->refs = 1; sh->gpu_owned = 1; sh->samples = 1; sh->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        sh->w = w0; sh->h = h0; sh->depth = im->depth; sh->layers = im->layers;
+        uint32_t mx = w0 > h0 ? w0 : h0;
+        if (is3d && sh->depth > mx) mx = sh->depth;
+        uint32_t max_lv = 1; while (mx > 1) { mx >>= 1; max_lv++; }
+        sh->levels = im->levels < max_lv ? im->levels : max_lv;
+        VkImageType it = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        VkImageUsageFlags u = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImageCreateFlags fl = (is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0) | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        int any = 1;
+        VkImageFormatProperties ip;
+        VkResult fr = vk.vkGetPhysicalDeviceImageFormatProperties(V.pd, vf->vk, it, VK_IMAGE_TILING_OPTIMAL, u, fl, &ip);
+        if (fr && !vf->srgb) { fl &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; any = 0; fr = vk.vkGetPhysicalDeviceImageFormatProperties(V.pd, vf->vk, it, VK_IMAGE_TILING_OPTIMAL, u, fl, &ip); }
+        if (fr || sh->w > ip.maxExtent.width || sh->h > ip.maxExtent.height || sh->depth > ip.maxExtent.depth || sh->levels > ip.maxMipLevels || sh->layers > ip.maxArrayLayers) {
+            im->bshad_fail = 1; free(sh); return NULL;
+        }
+        sh->usage = u; sh->any_fmt = any;
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = fl, .imageType = it, .format = vf->vk, .extent = {sh->w, sh->h, sh->depth},
+            .mipLevels = sh->levels, .arrayLayers = sh->layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        if (vk.vkCreateImage(V.dev, &ci, NULL, &sh->img)) { im->bshad_fail = 1; free(sh); return NULL; }
+        VkMemoryRequirements mr; vk.vkGetImageMemoryRequirements(V.dev, sh->img, &mr);
+        uint32_t mt = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0); if (mt == UINT32_MAX) mt = vka_mem_type(mr.memoryTypeBits, 0, 0);
+        if (mt == UINT32_MAX || vka_imem_bind(sh->img, mt, &mr, &sh->m)) { vk.vkDestroyImage(V.dev, sh->img, NULL); im->bshad_fail = 1; free(sh); return NULL; }
+        pthread_mutex_lock(&g_tmu);
+        sh->bytes = mr.size; g_img_bytes += mr.size; g_img_made += mr.size; vka_mem_grew(mr.size);
+        im->bshad = sh;
+        pthread_mutex_unlock(&g_tmu);
+        vka_img_barrier(cb, sh->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        VkClearColorValue z = {{0}};
+        VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        vk.vkCmdClearColorImage(cb, sh->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+        vka_barrier(cb);
+        sh->inited = 1;
+        VLOG("block-RT shadow: serial %llu %ux%ux%u (layers %u levels %u) format %#x (VkFormat %d) -> shadow %ux%ux%u (levels %u) VkFormat %d (%llu bytes)",
+             (unsigned long long)im->serial, im->w, im->h, im->depth, im->layers, im->levels, im->d.format, im->f.vk,
+             sh->w, sh->h, sh->depth, sh->levels, vf->vk, (unsigned long long)sh->bytes);
+    }
+    vka_img *sh = im->bshad;
+    if (!img_lists(sh, vf->view)) return NULL;
+    if (sh->w != w0 || sh->h != h0 || sh->depth != im->depth || sh->layers != im->layers) return NULL;
+    uint32_t s_lv = lv < sh->levels ? lv : sh->levels - 1;
+    uint32_t s_w = sh->w >> s_lv ? sh->w >> s_lv : 1, s_h = sh->h >> s_lv ? sh->h >> s_lv : 1;
+    uint32_t s_d = is3d ? (sh->depth >> s_lv ? sh->depth >> s_lv : 1) : sh->layers;
+    if (s_w != bw_lv || s_h != bh_lv || l0 + nl > s_d) return NULL;
+    *slv = s_lv; *sw = s_w; *shh = s_h;
+    return sh;
+}
+void vka_tex_block_copy(VkCommandBuffer cb, const vka_img *src, uint32_t slv, const vka_img *dst, uint32_t dlv, uint32_t l0, uint32_t nl, uint32_t w, uint32_t h) {
+    int is3d = dst->d.target == NVN_TEXTURE_TARGET_3D;
+    VkImageCopy r = {
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, slv, is3d ? 0 : l0, is3d ? 1 : nl},
+        .srcOffset = {0, 0, is3d ? (int32_t)l0 : 0},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dlv, is3d ? 0 : l0, is3d ? 1 : nl},
+        .dstOffset = {0, 0, is3d ? (int32_t)l0 : 0},
+        .extent = {w, h, is3d ? nl : 1},
+    };
+    vk.vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+}
+
 // The content a new image of t starts with (storage_mode), decided before the image is made (vka_tex_get: a zero-shared image is made only for ST_ZERO)
 static int first_mode(const tex_t *t, const vka_fmt *f, int cpu) {
     int samples = t->d.samples > 1 ? t->d.samples : 1, vpool = t->pool && pool_sparse(t->pool);
@@ -1511,7 +1595,7 @@ static void dalias_end(smap_ent *e, vka_img *im, const tex_t *t) {   // caller h
     for (int i = 0; i < g_nlive; i++) if (g_live[i] == im) { g_live[i] = g_live[--g_nlive]; break; }
     for (int i = 0; i < g_nbig; i++) if (g_big[i] == im) { g_big[i] = g_big[--g_nbig]; break; }
     rtw_forget(im); rl_note(im, "gone");
-    g_img_bytes -= im->bytes;
+    g_img_bytes -= im->bytes + (im->bshad ? im->bshad->bytes : 0);
     vka_after(vka_fence_last() + 1, img_destroy, im);
 }
 // ---------- Mip drop under memory pressure (DM_VK_MIPDROP) ----------
@@ -3404,7 +3488,8 @@ static void tex_evict(void) {   // caller holds g_tmu
         for (int k = 0; k < g_nlive; k++) if (g_live[k] == im) { g_live[k] = g_live[--g_nlive]; break; }
         for (int k = 0; k < g_nbig; k++) if (g_big[k] == im) { g_big[k] = g_big[--g_nbig]; break; }
         rtw_forget(im); rl_note(im, "gone (evicted)");
-        g_img_bytes -= im->bytes; bytes += im->bytes; n++;
+        uint64_t ib = im->bytes + (im->bshad ? im->bshad->bytes : 0);
+        g_img_bytes -= ib; bytes += ib; n++;
         if ((im->ev_state & EV_MASK) == EV_DEAD) { g_evd_n++; g_evd_bytes += im->bytes; iv_dn++; iv_dbytes += im->bytes; }
         if (im->ev_state & EV_UNSEEN) { g_evu_n++; g_evu_bytes += im->bytes; iv_un++; iv_ubytes += im->bytes; }
         if (im->tfb_rel) { g_tfb_rn++; g_tfb_rb += im->bytes; if (tpin_has(im->serial)) { g_tfb_pcn++; g_tfb_pcb += im->bytes; } }

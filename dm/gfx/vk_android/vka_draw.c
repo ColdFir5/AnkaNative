@@ -192,6 +192,7 @@ static struct {
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
     vka_img *wim[9]; int8_t wslot[9]; int nw;            // its watched big attachments (DM_VK_RTWATCH_MB, vka_tex.c "Big targets"): colour index, or -1 depth / stencil
     VkImageView vrs_view; uint32_t vrs_w, vrs_h; uint64_t vrs_gen; int vrs_fb;   // VRS attachment attached to this pass (DM_VK_VRS=1)
+    struct { vka_img *dst, *src; uint32_t dlv, slv, l0, nl, w, h; } bcopy[8]; int nbcopy;   // block-RT shadows to copy back into their compressed images at vka_rp_end (DM_VK_BLOCK_RT)
 } R;
 // Clears waiting for the pass of their targets (vka_rp_clear), in order: the next draw over the same targets opens its pass with them (loadOp CLEAR, or vkCmdClearAttachments),
 // anything else does them outside a pass first (pc_flush), as before
@@ -220,7 +221,12 @@ void vka_rp_end(void) {
     if (vka_gp_split) vka_gp_rp_end(g_cb);   // DM_VK_GPUPROF_SPLIT: the split pass's last timestamp, inside it
     vk.vkCmdEndRendering(g_cb);
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
-    R.on = 0; vka_tex_feedback(NULL, NULL, 0);
+    if (R.nbcopy) {
+        for (int k = 0; k < R.nbcopy; k++)
+            vka_tex_block_copy(g_cb, R.bcopy[k].src, R.bcopy[k].slv, R.bcopy[k].dst, R.bcopy[k].dlv, R.bcopy[k].l0, R.bcopy[k].nl, R.bcopy[k].w, R.bcopy[k].h);
+        vka_barrier(g_cb);   // the shadow copies into compressed targets before any subsequent sample or transfer
+    }
+    R.on = 0; R.nbcopy = 0; vka_tex_feedback(NULL, NULL, 0);
     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
 }
 static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv, uint32_t *l0, uint32_t *nl) {
@@ -231,12 +237,34 @@ static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv
     *nl = has_v && v->set_layers && v->nlayers ? v->nlayers : all - (*l0 < all ? *l0 : 0);
     if (*l0 + *nl > all) *nl = *l0 < all ? all - *l0 : 0;
 }
+static _Atomic uint64_t g_ct_drop;
+typedef struct { int slot, has_vfmt, vfmt, vkfmt, tfmt; uint64_t serial; uint32_t w, h, depth, levels, layers, vlv, vl0, vnl, usage; } drop_ct;
+static void log_drop_ct(const drop_ct *drop, int ndrop, const p_set_rt *rt, int n, int bound_c, int has_ds, uint32_t pw, uint32_t ph, uint32_t pl, vka_shader *const sh[VKA_NSTAGE]) {
+    uint64_t sk0 = sh && sh[7] ? sh[7]->key : sh && sh[0] ? sh[0]->key : 0;
+    const char *skn = sh && sh[7] ? "ms" : "vs";
+    uint64_t fsk = sh && sh[1] ? sh[1]->key : 0;
+    for (int k = 0; k < ndrop; k++) {
+        const drop_ct *dc = &drop[k];
+        int other_rt = 0;
+        for (int j = 0; j < n; j++) if (j != dc->slot && rt->color[j]) other_rt++;
+        if (atomic_fetch_add_explicit(&g_ct_drop, 1, memory_order_relaxed) < 8) {
+            char vf[24];
+            if (dc->has_vfmt) snprintf(vf, sizeof vf, "%#x", dc->vfmt); else strcpy(vf, "none");
+            VRED("colour target %d (serial %llu format %#x view_fmt %s vk %d) cannot be a Vulkan colour attachment: not drawn into "
+                 "(img %ux%ux%u lv=%u ly=%u view lv=%u ly=%u+%u usage=%#x pass=%ux%ux%u other_rt=%d bound_c=%d ds=%d %s=%016llx fs=%016llx)",
+                 dc->slot, (unsigned long long)dc->serial, dc->tfmt, vf, dc->vkfmt,
+                 dc->w, dc->h, dc->depth, dc->levels, dc->layers, dc->vlv, dc->vl0, dc->vnl, dc->usage,
+                 pw, ph, pl, other_rt, bound_c, has_ds, skn, (unsigned long long)sk0, (unsigned long long)fsk);
+        }
+    }
+}
 // Opens the pass over the bound targets: 0 = it cannot (no target can be an attachment), logged
-static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
+static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
     if (R.on) { if ((!g_pass_keep || rt_same(rt, has_rt, &R.rt, R.has_rt)) && (!V.vrs || R.vrs_gen == d->vrs.gen)) return 1; vka_rp_end(); }   // a new SET_RT of other targets (or VRS change under DM_VK_VRS=1) ends the pass at its first draw
     if (PC.n && !rt_same(rt, has_rt, &PC.rt, 1)) pc_flush();                             // clears of other targets: done before
     VkRenderingAttachmentInfo ca[8], da = {0}, sa; uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX, samples = 0;
     vka_img *fb_im[9]; uint32_t fb_lv[9]; int nfb = 0;   // the attachments' images and levels (vka_tex_feedback)
+    drop_ct drop[8]; int ndrop = 0;
     memset(&R, 0, sizeof R);
     if (has_rt) R.rt = *rt; R.has_rt = has_rt;
     int n = has_rt ? (rt->n < 8 ? rt->n : 8) : 0;
@@ -245,19 +273,41 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
         R.cf[i] = VK_FORMAT_UNDEFINED;
         const tex_t *t = rt->color[i]; if (!t) continue;
         vka_rl_site = VKA_RL_ATT; vka_img *im = vka_tex_get(t, g_cb); vka_rl_site = 0; vka_fmt f;   // (vka_rl_site: DM_VK_RTLOG_MB's path)
-        if (!im || !vka_fmt_of(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : t->d.format, &f)) continue;
-        if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3) { VRED_ONCE("colour target %d (format %#x) cannot be a Vulkan colour attachment: not drawn into", i, t->d.format); continue; }
-        if (im->depth > 1 && !(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) continue;   // its slices are drawn into through 2D-array views (img_create)
-        vka_tex_whole(im, g_cb);   // (a coarse-first image made without its finer levels: whole before rt_range maps the level, vka_tex.c "Coarse-first")
-        uint32_t lv, l0, nl; rt_range(im, &rt->cview[i], rt->has_cview[i], &lv, &l0, &nl);
-        if (lv >= im->levels || !nl) continue;
+        int has_vfmt = rt->has_cview[i] && rt->cview[i].set_format;
+        if (!im || !vka_fmt_of(has_vfmt ? rt->cview[i].format : t->d.format, &f)) continue;
+        vka_img *aim = im; uint32_t lv = 0, l0 = 0, nl = 0, slv = 0, lw = 0, lh = 0; int is_bshad = 0;
+        if (!(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || f.kind >= 3) {
+            vka_img *sh = NULL;
+            if (f.kind < 3 && (im->f.bw > 1 || im->f.bh > 1) && f.bw == 1 && f.bh == 1 && f.bpb == im->f.bpb && vka_block_rt_on()) {
+                vka_tex_whole(im, g_cb);
+                rt_range(im, &rt->cview[i], rt->has_cview[i], &lv, &l0, &nl);
+                if (lv >= im->levels || !nl) continue;
+                sh = vka_tex_block_shadow(im, &f, lv, l0, nl, g_cb, &slv, &lw, &lh);
+            }
+            if (!sh) {
+                uint32_t vlv = rt->has_cview[i] && rt->cview[i].set_levels ? rt->cview[i].base_level : 0;
+                uint32_t vl0 = rt->has_cview[i] && rt->cview[i].set_layers ? rt->cview[i].min_layer : 0;
+                uint32_t all = im->d.target == NVN_TEXTURE_TARGET_3D ? (vlv < 32 && (im->depth >> vlv) ? im->depth >> vlv : 1) : im->layers;
+                uint32_t vnl = rt->has_cview[i] && rt->cview[i].set_layers && rt->cview[i].nlayers ? rt->cview[i].nlayers : (vl0 < all ? all - vl0 : 0);
+                drop[ndrop++] = (drop_ct){i, has_vfmt, has_vfmt ? rt->cview[i].format : 0, (int)f.view, t->d.format, t->serial,
+                                          im->w, im->h, im->depth, im->levels, im->layers, vlv, vl0, vnl, (uint32_t)im->usage};
+                continue;
+            }
+            aim = sh; is_bshad = 1;
+        } else {
+            if (im->depth > 1 && !(im->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) continue;   // its slices are drawn into through 2D-array views (img_create)
+            vka_tex_whole(im, g_cb);   // (a coarse-first image made without its finer levels: whole before rt_range maps the level, vka_tex.c "Coarse-first")
+            rt_range(im, &rt->cview[i], rt->has_cview[i], &lv, &l0, &nl);
+            if (lv >= im->levels || !nl) continue;
+            slv = lv; lw = im->w >> lv ? im->w >> lv : 1; lh = im->h >> lv ? im->h >> lv : 1;
+        }
         if (samples && im->samples != samples) { VRED_ONCE("colour targets of different sample counts"); continue; }
         vka_tex_own(im, g_cb);   // (a zero-shared image gets memory of its own before it is drawn into: no pass is open here)
-        VkImageView v = vka_view(im, f.view, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, l0, nl, NULL);
+        VkImageView v = vka_view(aim, f.view, nl > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, slv, 1, l0, nl, NULL);
         if (!v) continue;
         ca[i].imageView = v; R.cf[i] = f.view; R.ckind[i] = f.kind; samples = im->samples; fb_im[nfb] = im; fb_lv[nfb++] = lv;
         R.cim[R.nci] = im; R.clv[R.nci] = lv; R.cl0[R.nci++] = l0;
-        uint32_t lw = im->w >> lv ? im->w >> lv : 1, lh = im->h >> lv ? im->h >> lv : 1;
+        if (is_bshad) R.bcopy[R.nbcopy++] = (typeof(R.bcopy[0])){im, aim, lv, slv, l0, nl, lw, lh};
         R.cnl[i] = nl; R.cext[i] = (VkExtent2D){lw, lh};
         if (lw < w) w = lw; if (lh < h) h = lh; if (nl < layers) layers = nl;
         if (im->rtw && R.nw < 9) { R.wim[R.nw] = im; R.wslot[R.nw++] = (int8_t)i; vka_rtw(im, VKA_RTW_PASS); }
@@ -285,9 +335,10 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
         } else if (im) VRED_ONCE("depth target (format %#x) cannot be a Vulkan depth attachment: drawn without depth", rt->depth->d.format);
     }
     if (w == UINT32_MAX) {   // no attachment at all (rasterizer discard, or targets Vulkan cannot take): the viewport's size, for side effects
-        if (!d->has_vp) { VRED_ONCE("a draw with no render target and no viewport: skipped"); return 0; }
+        if (!d->has_vp) { if (ndrop) log_drop_ct(drop, ndrop, rt, n, R.nci, dp || sp ? 1 : 0, 0, 0, 0, sh); VRED_ONCE("a draw with no render target and no viewport: skipped"); return 0; }
         w = (uint32_t)fabsf(d->vp[0][2]); h = (uint32_t)fabsf(d->vp[0][3]); if (!w) w = 1; if (!h) h = 1; layers = 1;
     }
+    if (ndrop) log_drop_ct(drop, ndrop, rt, n, R.nci, dp || sp ? 1 : 0, w, h, layers, sh);
     R.area = (VkRect2D){{0, 0}, {w, h}}; R.layers = layers; R.samples = samples ? samples : 1;
     R.vrs_gen = d->vrs.gen;
     VkRenderingFragmentShadingRateAttachmentInfoKHR fsr_att = {0};
@@ -368,6 +419,13 @@ void vka_rp_bar_stats(char *b, size_t n, double frames) {
     snprintf(b, n, "game barriers inside a draw pass per frame: %.1f, %.1f taken inside it (DM_VK_BAR_KEEP), %.1f of those ended it later at a draw sampling its targets or writing memory",
              (g_bar_in - i0) / frames, (g_bar_kept - k0) / frames, (g_bar_late - l0) / frames);
     i0 = g_bar_in; k0 = g_bar_kept; l0 = g_bar_late;
+}
+void vka_rp_drop_stats(char *b, size_t n, double frames) {
+    static uint64_t d0;
+    uint64_t d = atomic_load_explicit(&g_ct_drop, memory_order_relaxed);
+    if (frames <= 0 || d == d0) { if (n) b[0] = 0; d0 = d; return; }
+    snprintf(b, n, "dropped colour targets: %llu total (+%llu over %.0f frames, %.2f/frame)", (unsigned long long)d, (unsigned long long)(d - d0), frames, (d - d0) / frames);
+    d0 = d;
 }
 int vka_rp_is_open(void) { return R.on; }
 int vka_rp_open_for(const p_set_rt *rt, int has_rt) { return R.on && rt_same(rt, has_rt, &R.rt, R.has_rt); }
@@ -2154,7 +2212,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         vka_nan_inputs(g_cb, ims, bs, ts, m);
     }
     { static uint64_t fr = ~0ull, sk[32]; static int nsk; if (sh[1] && tmp_skip_key("DM_VK_TMP_SKIP_FS", sh[1]->key, &fr, sk, &nsk)) { g_skipped++; return; } }   // TEMP
-    if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
+    if (!rp_begin(rt, has_rt, d, sh)) { g_skipped++; return; }
     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
     d->b.samples = R.samples;
     vka_gkey k; memset(&k, 0, V.vin_dyn ? offsetof(vka_gkey, va) : sizeof k);   // (va, vb: only without vertex input dynamic state, vin_build; the pipeline lookup reads no further then)
