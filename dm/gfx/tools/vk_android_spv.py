@@ -677,6 +677,33 @@ def per_primitive_inputs(m, locs):
     return done
 
 
+DEC_INVARIANT = 18
+
+
+def mesh_invariant_position(m):
+    """Decorate every BuiltIn Position output with Invariant so Mesa (nir_propagate_invariant) keeps exact position arithmetic across shaders: games like Ocarina of Time
+    draw foliage / doors in a depth pre-pass with one mesh shader and shade with EQUAL in another. The translator marks vertex shaders' position Invariant (Declarations.cs
+    CreatePerVertexStructType under ReducedPrecision), but its mesh entry point (SpirvMeshEntry.cs) omits Invariant on the Position block member, letting Mesa fuse FMAs
+    differently and fail EQUAL. Inserted immediately after the BuiltIn Position decoration; leaves bound and all other instructions untouched. → decorations inserted"""
+    have_mem = {(x[1], x[2]) for x in m.ins if (x[0] & 0xffff) == OP_MEMBER_DECORATE and len(x) >= 4 and x[3] == DEC_INVARIANT}
+    have_var = {x[1] for x in m.ins if (x[0] & 0xffff) == OP_DECORATE and len(x) >= 3 and x[2] == DEC_INVARIANT}
+    out, n = [], 0
+    for x in m.ins:
+        out.append(x)
+        op = x[0] & 0xffff
+        if op == OP_MEMBER_DECORATE and len(x) >= 5 and x[3] == DEC_BUILTIN and x[4] == BUILTIN_POSITION and (x[1], x[2]) not in have_mem:
+            out.append([4 << 16 | OP_MEMBER_DECORATE, x[1], x[2], DEC_INVARIANT])
+            have_mem.add((x[1], x[2]))
+            n += 1
+        elif op == OP_DECORATE and len(x) >= 4 and x[2] == DEC_BUILTIN and x[3] == BUILTIN_POSITION and x[1] not in have_var:
+            out.append([3 << 16 | OP_DECORATE, x[1], DEC_INVARIANT])
+            m.decos.setdefault(x[1], {})[DEC_INVARIANT] = []
+            have_var.add(x[1])
+            n += 1
+    if n: m.ins[:] = out
+    return n
+
+
 OP_PTR_ACCESS_CHAIN, DEC_BLOCK_ = 67, 2
 
 

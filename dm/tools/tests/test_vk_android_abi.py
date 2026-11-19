@@ -236,13 +236,54 @@ OpFunctionEnd
 '''
 
 
+# A mesh shader as the translator writes one: a Block struct with BuiltIn Position as an Output array, without Invariant
+MS = '''OpCapability MeshShadingEXT
+OpExtension "SPV_EXT_mesh_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint MeshEXT %main "main" %verts %tris
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionMode %main OutputVertices 3
+OpExecutionMode %main OutputPrimitivesEXT 1
+OpExecutionMode %main OutputTrianglesEXT
+OpDecorate %blk Block
+OpMemberDecorate %blk 0 BuiltIn Position
+OpDecorate %tris BuiltIn PrimitiveTriangleIndicesEXT
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%u32 = OpTypeInt 32 0
+%v3u = OpTypeVector %u32 3
+%u1 = OpConstant %u32 1
+%u3 = OpConstant %u32 3
+%u0 = OpConstant %u32 0
+%blk = OpTypeStruct %v4
+%arr = OpTypeArray %blk %u3
+%parr = OpTypePointer Output %arr
+%verts = OpVariable %parr Output
+%tarr = OpTypeArray %v3u %u1
+%ptarr = OpTypePointer Output %tarr
+%tris = OpVariable %ptarr Output
+%pv4 = OpTypePointer Output %v4
+%f0 = OpConstant %f32 0
+%zero = OpConstantComposite %v4 %f0 %f0 %f0 %f0
+%main = OpFunction %void None %fn
+%l = OpLabel
+OpSetMeshOutputsEXT %u3 %u1
+%p = OpAccessChain %pv4 %verts %u0 %u0
+OpStore %p %zero
+OpReturn
+OpFunctionEnd
+'''
+
+
 @unittest.skipUnless(shutil.which('spirv-as') and shutil.which('spirv-val'), 'SPIRV-Tools not installed')
 class Rewrites(unittest.TestCase):
-    def module(self, text):
+    def module(self, text, env='spv1.3'):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / 'a.spvasm').write_text(text)
-            subprocess.run(['spirv-as', '--target-env', 'spv1.3', str(Path(d) / 'a.spvasm'), '-o', str(Path(d) / 'a.spv')], check=True)
-            return spv.Module((Path(d) / "a.spv").read_bytes())   # SPIR-V 1.3, as the translator writes
+            subprocess.run(['spirv-as', '--target-env', env, str(Path(d) / 'a.spvasm'), '-o', str(Path(d) / 'a.spv')], check=True)
+            return spv.Module((Path(d) / "a.spv").read_bytes())   # SPIR-V 1.3 by default, as the translator writes
 
     def valid(self, m):
         with tempfile.TemporaryDirectory() as d:
@@ -307,6 +348,24 @@ class Rewrites(unittest.TestCase):
         self.assertNotIn(5255, m.caps)
         self.assertEqual(m.exts, [])
         if text: self.assertIn('Private', text); self.assertNotIn('ViewportMaskNV', text)
+
+    def test_mesh_invariant_position(self):
+        m = self.module(MS, env='spv1.4')
+        bound = m.header[3]
+        self.assertEqual(spv.mesh_invariant_position(m), 1)
+        self.assertEqual(m.header[3], bound)
+        self.assertEqual(spv.mesh_invariant_position(m), 0)   # idempotent
+        text = self.valid(m)
+        if text:
+            lines = [l.strip() for l in text.splitlines()]
+            i = next(k for k, l in enumerate(lines) if re.match(r'^OpMemberDecorate %\S+ 0 BuiltIn Position$', l))
+            struct_id = lines[i].split()[1]
+            self.assertEqual(lines[i + 1], f'OpMemberDecorate {struct_id} 0 Invariant')
+        # a vertex module whose position is already Invariant gets 0
+        vs_inv = VS.replace('OpMemberDecorate %blk 0 BuiltIn Position', 'OpMemberDecorate %blk 0 BuiltIn Position\nOpMemberDecorate %blk 0 Invariant')
+        mv = self.module(vs_inv)
+        self.assertEqual(spv.mesh_invariant_position(mv), 0)
+        self.valid(mv)
 
 
 if __name__ == '__main__':

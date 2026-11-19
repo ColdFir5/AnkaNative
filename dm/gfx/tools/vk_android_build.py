@@ -610,8 +610,10 @@ def finish(key, w, job, c1):
     elif stage == 'ps': PS_INPUTS[key] = set(m.io(spv.SC_INPUT))
     prim = spv.per_primitive_inputs(m, MESH_PRIM[key]) if stage == 'ps' and key in MESH_PRIM else []
     gl = stage in ('vs', 'ds', 'gs') and spv.gl_depth(m, VK['SPEC_GL_DEPTH'])
+    n_mesh_inv = 0
     if stage == 'ms':   # the translator adds the constant itself (job gl_depth_spec: a mesh program may not read its outputs back)
         gl = any(d.get(spv.DEC_SPEC_ID) == [VK['SPEC_GL_DEPTH']] for d in m.decos.values())
+        n_mesh_inv = spv.mesh_invariant_position(m)
     alpha = stage == 'ps' and spv.alpha_test(m, VK['SPEC_ALPHA_FUNC'])
     if OOT_FADE3 and key == 'e855420a39e60874':
         if spv.oot_fade3(m):
@@ -692,7 +694,7 @@ def finish(key, w, job, c1):
             if not sp: e['kind'] = abi.KIND_UNKNOWN; continue   # (the replay then refuses the shader)
             e['bytes'] = sp['bytes']; shared = sp['workgroup']
     refl = {'key': key, 'stage': stage, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'c1': c1.hex(), 'local': job.get('local') or [1, 1, 1], 'shared': shared,
-            'notes': res['notes'], 'vs_pad': pad, 'mesh': res.get('mesh'), 'ps_prim': prim, 'caps_dropped': dropped, 'caps_added': added, 'precise': n_precise, **({'fetch_offset': n_fetch_off} if n_fetch_off else {}), 'hmma_lds': hmma, 'gmem_flat': gflat, 'gmem_loop': gloop, **({'gmem_cache': gcache} if spv.GMEM_CACHE and not spv.GMEM_PIDX else {}), **({'gmem_pidx': gpidx} if spv.GMEM_PIDX else {}), 'gmem_loop_left': gleft, 'ssbo_base': sbase, 'fwd_loads': nfwd, 'texfb_sites': texfb[0], 'texfb_pool_sites': texfb[1], 'texfb_failed': fb_err, 'drv_reads': drv_reads(binds, m), 'tf': job.get('tf'), **fa,
+            'notes': res['notes'], 'vs_pad': pad, 'mesh': res.get('mesh'), 'ps_prim': prim, 'caps_dropped': dropped, 'caps_added': added, 'precise': n_precise, **({'fetch_offset': n_fetch_off} if n_fetch_off else {}), **({'mesh_invariant': n_mesh_inv} if n_mesh_inv else {}), 'hmma_lds': hmma, 'gmem_flat': gflat, 'gmem_loop': gloop, **({'gmem_cache': gcache} if spv.GMEM_CACHE and not spv.GMEM_PIDX else {}), **({'gmem_pidx': gpidx} if spv.GMEM_PIDX else {}), 'gmem_loop_left': gleft, 'ssbo_base': sbase, 'fwd_loads': nfwd, 'texfb_sites': texfb[0], 'texfb_pool_sites': texfb[1], 'texfb_failed': fb_err, 'drv_reads': drv_reads(binds, m), 'tf': job.get('tf'), **fa,
             'bindings': [{kk: v for kk, v in e.items() if kk not in ('id', 'tbind', 'index')} for e in binds]}
     loose = os.environ.get('DMSH_VK_LOOSE') == '1'
     out_mods = []
@@ -1150,6 +1152,7 @@ print(f'shaders with a binding whose slot was not decoded {len(noreg)}, with an 
 for e, n in collections.Counter(f"{KIND[b['kind']]} {b['name'][:28]}" for x in noreg + unk for b in x['bindings'] if b['flags'] & VK['BF_NOSLOT'] or b['kind'] == abi.KIND_UNKNOWN or b.get('skind') == abi.KIND_UNKNOWN).most_common(8): print(f'  {n:5d}  {e}')
 print(f'texel fetches with a register offset made coordinate adds (fetch_offset): {sum(x.get("fetch_offset", 0) for x in okr)} in {sum(1 for x in okr if x.get("fetch_offset"))} shaders')
 print(f'min / max / clamp made NaN-exact (NMin / NMax / NClamp): {sum(x["precise"] for x in okr)} in {sum(1 for x in okr if x["precise"])} shaders')
+print(f'mesh shader positions decorated Invariant (mesh_invariant_position): {sum(x.get("mesh_invariant", 0) for x in okr)} in {sum(1 for x in okr if x.get("mesh_invariant"))} shaders')
 dr = collections.Counter(b for x in okr for b in x['drv_reads'])
 print('driver segment reads: ' + (', '.join(f'c{b} in {n} shaders' for b, n in sorted(dr.items())) or 'none') +
       f'; vertex shaders reading the base instance word c0 + {abi.C0_BASE_INSTANCE:#x}: {sum(1 for x in okr if x["stage"] == "vs" and abi.C0_BASE_INSTANCE in x["drv_reads"].get("0", {}).get("offsets", ()))}' +

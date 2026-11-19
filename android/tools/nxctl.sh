@@ -51,5 +51,6 @@ printf '%s\n' "${out:-(no answer in the log yet: nxctl.sh log)}"
 if [ "$1" = screenshot ] || [ "$1" = texshot ]; then
     remote=$(printf '%s' "$out" | sed -n 's/.*screenshot of frame [0-9]*, [0-9x]* → //p' | tail -1)
     [ -n "$remote" ] || { echo "no screenshot written" >&2; exit 1; }
-    $A pull "$remote" "${shot_local:-$(basename "$remote")}" >/dev/null && echo "pulled ${shot_local:-$(basename "$remote")}"
+    $A pull "$remote" "${shot_local:-$(basename "$remote")}" >/dev/null && echo "pulled ${shot_local:-$(basename "$remote")}" &&
+        { $A shell "run-as $PKG rm -f '$remote'" 2>/dev/null || $A shell "rm -f '$remote'" 2>/dev/null || true; }   # (the app writes it 0644: only its own user can remove it)
 fi
