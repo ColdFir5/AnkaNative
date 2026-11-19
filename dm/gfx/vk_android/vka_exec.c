@@ -886,6 +886,11 @@ static void exec(const uint8_t *p, int depth) {
         case OP_SET_RT: if (g_cb && !vka_pass_keep()) vka_rp_end(); break;
         case OP_BARRIER: if (g_cb) { int32_t bits; memcpy(&bits, a, 4); bar_kept = vka_rp_game_barrier((uint32_t)bits); if (!bar_kept) vka_rp_end(); } break;
         case OP_CLEAR_COLOR: case OP_CLEAR_DS: break;   // the pass is ended by the next draw over other targets, or the clear (vka_rp_clear)
+        case OP_VRS_BIND: case OP_VRS_PALETTE: case OP_VRS_MODE: {
+            uint64_t g0 = S.d.vrs.gen;
+            vka_state_op(&S.d, h.op, a);
+            if (V.vrs && g_cb && S.d.vrs.gen != g0 && vka_rp_is_open()) vka_rp_end();
+            break; }
         default: if (g_cb && !vka_state_op(&S.d, h.op, a)) vka_rp_end(); else if (!g_cb) vka_state_op(&S.d, h.op, a); break;
         }
         if (vka_rprof_on) { uint64_t t_ = vka_rprof_t(); g_rp.k[RK_STATE] += t_ - ra_; ra_ = t_; }

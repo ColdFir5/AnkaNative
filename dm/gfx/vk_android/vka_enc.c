@@ -30,7 +30,8 @@
     X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants) X(vkCmdSetLineWidth) \
-    X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT)
+    X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) \
+    X(vkCmdSetFragmentShadingRateKHR)
 #define ENC_ID(f) E_##f,
 enum { E_WRAP = 0, E_CALL, ENC_FNS(ENC_ID) E_N };
 #define ENC_REAL(f) PFN_##f f;
@@ -204,14 +205,23 @@ static void VKAPI_CALL e_vkCmdClearAttachments(VkCommandBuffer cb, uint32_t na, 
 }
 static void VKAPI_CALL e_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
     DIRECT(vkCmdBeginRendering, cb, ri);
-    int pn = ri->pNext != NULL;
+    const VkRenderingFragmentShadingRateAttachmentInfoKHR *fsr = NULL;
+    int pn = 0;
+    if (ri->pNext) {
+        const VkBaseInStructure *s = ri->pNext;
+        if (s->sType == VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR && !s->pNext)
+            fsr = (const VkRenderingFragmentShadingRateAttachmentInfoKHR *)s;
+        else pn = 1;
+    }
     for (uint32_t k = 0; k < ri->colorAttachmentCount; k++) pn |= ri->pColorAttachments[k].pNext != NULL;
     if (ri->pDepthAttachment) pn |= ri->pDepthAttachment->pNext != NULL;
     if (ri->pStencilAttachment) pn |= ri->pStencilAttachment->pNext != NULL;
     if (pn) FALLBACK(vkCmdBeginRendering, cb, ri);
     size_t na = ri->colorAttachmentCount * sizeof(VkRenderingAttachmentInfo), one = sizeof(VkRenderingAttachmentInfo);
-    BEGIN(r_rend, E_vkCmdBeginRendering, A8(na) + 2 * A8(one));
+    size_t fsrsz = fsr ? A8(sizeof *fsr) : 0;
+    BEGIN(r_rend, E_vkCmdBeginRendering, A8(na) + 2 * A8(one) + fsrsz);
     r->ri = *ri;
+    r->ri.pNext = fsr ? cpy(&at, fsr, sizeof *fsr) : NULL;
     r->ri.pColorAttachments = (void *)cpy(&at, ri->pColorAttachments, na);
     r->ri.pDepthAttachment = ri->pDepthAttachment ? (void *)cpy(&at, ri->pDepthAttachment, one) : NULL;
     r->ri.pStencilAttachment = ri->pStencilAttachment ? (void *)cpy(&at, ri->pStencilAttachment, one) : NULL;
@@ -322,6 +332,12 @@ static void VKAPI_CALL e_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout
     DIRECT(vkCmdPushConstants, cb, l, st, o, n, p);
     BEGIN(r_pc, E_vkCmdPushConstants, A8(n)); r->l = l; r->st = st; r->o = o; r->n = n; r->p = cpy(&at, p, n); END();
 }
+static void VKAPI_CALL e_vkCmdSetFragmentShadingRateKHR(VkCommandBuffer cb, const VkExtent2D *sz, const VkFragmentShadingRateCombinerOpKHR ops[2]) {
+    DIRECT(vkCmdSetFragmentShadingRateKHR, cb, sz, ops);
+    BEGIN(r_val, E_vkCmdSetFragmentShadingRateKHR, 0);
+    r->v[0] = sz->width; r->v[1] = sz->height; r->v[2] = (uint32_t)ops[0]; r->v[3] = (uint32_t)ops[1];
+    END();
+}
 
 // ---------- The encoder thread ----------
 static void run(const hdr *h) {
@@ -377,6 +393,7 @@ static void run(const hdr *h) {
     case E_vkCmdPushDescriptorSetKHR: { C(r_push); R.vkCmdPushDescriptorSetKHR(r->cb, r->bp, r->l, r->set, r->n, r->w); break; }
     case E_vkCmdSetVertexInputEXT: { C(r_vin); R.vkCmdSetVertexInputEXT(r->cb, r->nb, r->b, r->na, r->a); break; }
     case E_vkCmdPushConstants: { C(r_pc); R.vkCmdPushConstants(r->cb, r->l, r->st, r->o, r->n, r->p); break; }
+    case E_vkCmdSetFragmentShadingRateKHR: { C(r_val); VkExtent2D sz = {r->v[0], r->v[1]}; VkFragmentShadingRateCombinerOpKHR ops[2] = {(VkFragmentShadingRateCombinerOpKHR)r->v[2], (VkFragmentShadingRateCombinerOpKHR)r->v[3]}; R.vkCmdSetFragmentShadingRateKHR(r->cb, &sz, ops); break; }
     case E_CALL: { C(r_call); r->fn((const uint8_t *)r + A8(sizeof *r)); break; }
     default: break;
     }

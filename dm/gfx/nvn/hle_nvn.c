@@ -2937,6 +2937,78 @@ NVN_NOPROTO(nvnCommandBufferSetComputeOverlapMode, void, NVNcommandBuffer *c, in
 // device creation), so nothing is applied. Logged once with the first value; open: the scale of the values on the console
 NVN_NOPROTO(nvnCommandBufferSetComputeWorkloadPriority, void, NVNcommandBuffer *c, int prio) { (void)c; ONCE_LOG("nvnCommandBufferSetComputeWorkloadPriority %#x: the host runs all work on one queue in submission order", prio); }
 
+// NVN2 variable-rate shading (shading-rate images: recorded into command buffers as OP_VRS_* and applied on Vulkan when DM_VK_VRS=1).
+// The thunk (nvn_thunks.S) preserves x0..x7, so taking six uint64_t parameters captures raw x0..x5 without touching the thunks.
+// All guest pointer reads go through plat_mem_read so null / unmapped / non-pointer arguments never fault.
+__attribute__((weak)) void dm_gfx_vrs_bind(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
+                                           const tex_t *tex, int tex_valid, const view_t *view, int has_view, const uint64_t raw[4], int raw_ok) {
+    (void)x0; (void)x1; (void)x2; (void)x3; (void)x4; (void)x5; (void)tex; (void)tex_valid; (void)view; (void)has_view; (void)raw; (void)raw_ok;
+    ONCE_LOG("nvnCommandBufferBindShadingRateImage: shading-rate images are recorded but not applied (full-rate shading)");
+}
+__attribute__((weak)) void dm_gfx_vrs_palette(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
+                                              int vp, int count, uint64_t ptr, const char *ptr_reg, const uint32_t *entries, int nread) {
+    (void)x0; (void)x1; (void)x2; (void)x3; (void)x4; (void)x5; (void)vp; (void)count; (void)ptr; (void)ptr_reg; (void)entries; (void)nread;
+    ONCE_LOG("nvnCommandBufferShadingRateImagePalette: shading-rate palettes are recorded but not applied (full-rate shading)");
+}
+__attribute__((weak)) void dm_gfx_vrs_palette_mode(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5) {
+    (void)x0; (void)x1; (void)x2; (void)x3; (void)x4; (void)x5;
+    ONCE_LOG("nvnCommandBufferSetShadingRatePaletteMode: shading-rate palette mode is recorded but not applied (full-rate shading)");
+}
+static NVNcommandBuffer *vrs_cmd_of(uint64_t x0) {
+    uint32_t hdr[2] = {0};
+    if (x0 < 0x10000ull || (x0 & 7ull) || plat_mem_read(x0, hdr, sizeof hdr)) return NULL;
+    return hdr[0] == MAGIC('C', 'M', 'D', 'B') && hdr[1] ? (NVNcommandBuffer *)(uintptr_t)x0 : NULL;
+}
+NVN_NOPROTO(nvnCommandBufferBindShadingRateImage, void, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5) {
+    tex_t tex = {0}; view_t view = {0}; uint64_t raw[4] = {0};
+    int tex_valid = 0, has_view = 0, raw_ok = 0;
+    if (x1 >= 0x10000ull && !(x1 & 7ull)) {
+        if (!plat_mem_read(x1, &tex, sizeof tex) && tex.magic == MAGIC('T', 'E', 'X', 0)) tex_valid = 1;
+        else if (!plat_mem_read(x1, raw, sizeof raw)) raw_ok = 1;
+    }
+    if (x2 >= 0x10000ull && !(x2 & 3ull) && !plat_mem_read(x2, &view, sizeof view)) has_view = 1;
+    NVNcommandBuffer *c = vrs_cmd_of(x0);
+    if (c) {
+        if (tex_valid) {
+            p_vrs_bind *r = REC_SNAP(c, OP_VRS_BIND, p_vrs_bind, 1);
+            tex_t *s = (tex_t *)((uint8_t *)r + SNAP_OFF(p_vrs_bind));
+            *s = tex; r->tex = s;
+            if (has_view) { r->view = view; r->has_view = 1; }
+        } else {
+            p_vrs_bind *r = REC(c, OP_VRS_BIND, p_vrs_bind);
+            r->tex = NULL; r->has_view = 0;
+        }
+    }
+    dm_gfx_vrs_bind(x0, x1, x2, x3, x4, x5, tex_valid ? &tex : NULL, tex_valid, has_view ? &view : NULL, has_view, raw, raw_ok);
+}
+NVN_NOPROTO(nvnCommandBufferShadingRateImagePalette, void, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5) {
+    // Confirmed signature: (cmdBuf, viewport, entryCount, const NVNshadingRate *entries); fallback probe on x4 kept for safety.
+    int vp = (int)x1, count = (int)x2, nread = 0;
+    uint64_t ptr = x3; const char *ptr_reg = "x3";
+    uint32_t entries[32] = {0};
+    if (!(x3 >= 0x10000ull && !(x3 & 3ull)) && (x4 >= 0x10000ull && !(x4 & 3ull))) {
+        ptr = x4; ptr_reg = "x4"; count = (int)x3;
+    }
+    int want = count > 0 ? (count > 32 ? 32 : count) : 0;
+    if (want > 0 && ptr >= 0x10000ull && !(ptr & 3ull) && ptr <= UINT64_MAX - (uint64_t)want * 4ull) {
+        if (!plat_mem_read(ptr, entries, (size_t)want * 4u)) nread = want;
+        else { for (int i = 0; i < want; i++) if (!plat_mem_read(ptr + (uint64_t)i * 4ull, &entries[i], 4u)) nread = i + 1; else break; }
+    }
+    NVNcommandBuffer *c = vrs_cmd_of(x0);
+    if (c) {
+        int nstore = nread < 0 ? 0 : (nread > 32 ? 32 : nread);
+        p_vrs_palette *r = RECN(c, OP_VRS_PALETTE, p_vrs_palette, entries, nstore);
+        r->vp = vp; r->count = nstore;
+        if (nstore > 0) memcpy(r->entries, entries, (size_t)nstore * 4u);
+    }
+    dm_gfx_vrs_palette(x0, x1, x2, x3, x4, x5, vp, count, ptr, ptr_reg, entries, nread);
+}
+NVN_NOPROTO(nvnCommandBufferSetShadingRatePaletteMode, void, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5) {
+    NVNcommandBuffer *c = vrs_cmd_of(x0);
+    if (c) REC(c, OP_VRS_MODE, p_vrs_mode)->mode = (int32_t)x1;
+    dm_gfx_vrs_palette_mode(x0, x1, x2, x3, x4, x5);
+}
+
 // nvnProgramSetSampleShading (NVN 53+): whether the program's fragment shader runs once per sample of a multisampled target. Metroid Prime Remastered sets it on its programs
 // (modes 0, 1 and 2, from CGraphicsDeviceContext's sample shading state). Metal has no such switch: a fragment function runs per sample when it reads the sample index ([[sample_id]],
 // what PIXLD.MYINDEX translates to) or interpolates at a sample, and once per pixel otherwise, so the mode is not applied; on the single-sample targets met so far the two agree

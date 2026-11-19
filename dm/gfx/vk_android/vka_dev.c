@@ -189,7 +189,7 @@ static int init_once(void) {
 
     uint32_t nde = 0; vk.vkEnumerateDeviceExtensionProperties(V.pd, NULL, &nde, NULL);
     VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof *de); vk.vkEnumerateDeviceExtensionProperties(V.pd, NULL, &nde, de);
-    const char *dext[20]; uint32_t ndext = 0;
+    const char *dext[24]; uint32_t ndext = 0;
     { char q[700]; size_t qn = 0; q[0] = 0;   // the vendor's own extensions (tile properties, render pass transforms ...): what a tiler-specific path could use
       for (uint32_t i = 0; i < nde && qn < sizeof q; i++) if (strstr(de[i].extensionName, "_QCOM_")) qn += (size_t)snprintf(q + qn, sizeof q - qn, " %s", de[i].extensionName + 3);
       if (qn) VLOG("device extensions of the vendor:%s", q); }
@@ -223,6 +223,11 @@ static int init_once(void) {
     if (tmp_ps_env && tmp_ps_env[0]) tmp_pipe_stats_parse(tmp_ps_env);
     int tmp_ps_ext = g_tmp_pipe_stats_n > 0 && has_ext(de, nde, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (tmp_ps_ext) dext[ndext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+    // Variable-rate shading (DM_VK_VRS=1, restart only; off by default): enable VK_KHR_fragment_shading_rate only when asked
+    const char *vrs_env = getenv("DM_VK_VRS");
+    int vrs_want = vrs_env && atoi(vrs_env) != 0;
+    int x_vrs = vrs_want && has_ext(de, nde, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    if (x_vrs) dext[ndext++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
     free(de);
 
     // Every feature the device has, but robustness and capture-replay (they cost and nothing needs them); the shader side takes what it needs from the same device
@@ -238,7 +243,8 @@ static int init_once(void) {
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
     VkPhysicalDeviceDeviceMemoryReportFeaturesEXT fmr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_MEMORY_REPORT_FEATURES_EXT};
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR tmp_fps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
-    LINK(x_mr, fmr) LINK(tmp_ps_ext, tmp_fps)
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR ffsr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    LINK(x_mr, fmr) LINK(tmp_ps_ext, tmp_fps) LINK(x_vrs, ffsr)
     LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
@@ -251,6 +257,7 @@ static int init_once(void) {
     frob.robustBufferAccess2 = VK_FALSE; frob.robustImageAccess2 = VK_FALSE;   // only nullDescriptor: unbound slots read a null descriptor
     // Mesh shading: the task and mesh stages only (multiview, shading-rate and query support each need more of the device than the replay enables or uses)
     fmesh.multiviewMeshShader = VK_FALSE; fmesh.primitiveFragmentShadingRateMeshShader = VK_FALSE; fmesh.meshShaderQueries = VK_FALSE;
+    if (x_vrs) ffsr.primitiveFragmentShadingRate = VK_FALSE;   // only attachment-based VRS (and pipeline combiner) is used
     if (x_mesh && !fmesh.meshShader) fmesh.taskShader = VK_FALSE;   // (task shading is of no use without mesh shading)
     V.push_desc = x_push; V.vin_dyn = x_vin && fvin.vertexInputDynamicState; V.null_desc = x_rob && frob.nullDescriptor; V.idx8 = x_i8 && fi8.indexTypeUint8;
     V.divisor = x_div && fdiv.vertexAttributeInstanceRateDivisor; V.logic_op = f2.features.logicOp; V.dual_src = f2.features.dualSrcBlend; V.geom = f2.features.geometryShader;
@@ -293,7 +300,8 @@ static int init_once(void) {
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT pgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT, .pNext = &pm3};
     VkPhysicalDeviceDriverProperties pdr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, .pNext = x_gpl ? (void *)&pgpl : (void *)&pm3};
     VkPhysicalDeviceMeshShaderPropertiesEXT pmesh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT, .pNext = &pdr};
-    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = x_mesh ? (void *)&pmesh : (void *)&pdr};
+    VkPhysicalDeviceFragmentShadingRatePropertiesKHR pfsr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR, .pNext = x_mesh ? (void *)&pmesh : (void *)&pdr};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = x_vrs ? (void *)&pfsr : x_mesh ? (void *)&pmesh : (void *)&pdr};
     vk.vkGetPhysicalDeviceProperties2(V.pd, &p2);
     VLOG("driver: %s (%s), driver ID %d, conformance %u.%u.%u.%u, driver version %#x; %s", pdr.driverName, pdr.driverInfo, pdr.driverID, pdr.conformanceVersion.major,
          pdr.conformanceVersion.minor, pdr.conformanceVersion.subminor, pdr.conformanceVersion.patch, V.props.driverVersion, vka_driver_tag() ? "custom (DM_VK_DRIVER)" : "the system's");
@@ -324,6 +332,61 @@ static int init_once(void) {
     if (!vk.vkCmdPushDescriptorSetKHR) vk.vkCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)vk.vkGetDeviceProcAddr(V.dev, "vkCmdPushDescriptorSet");   // core in 1.4
     if (!vk.vkCmdPushDescriptorSetKHR) V.push_desc = 0, V.max_push = 0;
     if (!vk.vkCmdSetVertexInputEXT) V.vin_dyn = 0;
+    if (!vrs_want) {
+        VLOG("fragment shading rate (DM_VK_VRS): off (DM_VK_VRS=1 enables)");
+    } else {
+        // Y orientation (DM_VK_VRS_FLIP, restart only, default 0): in vka_draw.c, both UPPER_LEFT and LOWER_LEFT keep framebuffer row 0 aligned
+        // with NVN window y=0 (the same reason scissor y is never flipped; vka_present.c flips the window texture on present when vka_origin_ll()
+        // is 1), so NVN shading-rate image texel y=0 already maps to Vulkan attachment y=0. DM_VK_VRS_FLIP=1 flips Y if a game authors it inverted.
+        const char *fe = getenv("DM_VK_VRS_FLIP");
+        V.vrs_flip = fe && *fe ? atoi(fe) != 0 : 0;
+        VkFormatProperties r8p = {0};
+        if (x_vrs) vk.vkGetPhysicalDeviceFormatProperties(V.pd, VK_FORMAT_R8_UINT, &r8p);
+        int texel_ok = pfsr.minFragmentShadingRateAttachmentTexelSize.width <= 8 && pfsr.maxFragmentShadingRateAttachmentTexelSize.width >= 8 &&
+                       pfsr.minFragmentShadingRateAttachmentTexelSize.height <= 8 && pfsr.maxFragmentShadingRateAttachmentTexelSize.height >= 8;
+        int r8_ok = (r8p.optimalTilingFeatures & (VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) ==
+                    (VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        const char *why = NULL;
+        if (!x_vrs) why = "VK_KHR_fragment_shading_rate not on this device";
+        else if (!ffsr.attachmentFragmentShadingRate) why = "attachmentFragmentShadingRate feature not supported";
+        else if (!vk.vkCmdSetFragmentShadingRateKHR || !vk.vkGetPhysicalDeviceFragmentShadingRatesKHR) why = "entry points missing";
+        else if (!V.push_desc) why = "push descriptors unavailable (conversion pass needs them)";
+        else if (!f2.features.shaderStorageImageExtendedFormats) why = "shaderStorageImageExtendedFormats not supported (r8ui storage image)";
+        else if (!texel_ok) why = "attachment texel size does not cover 8x8";
+        else if (!r8_ok) why = "R8_UINT lacks FRAGMENT_SHADING_RATE_ATTACHMENT or STORAGE_IMAGE feature";
+        if (!why) {
+            uint32_t nr = 0;
+            VkPhysicalDeviceFragmentShadingRateKHR raw[32];
+            if (!vk.vkGetPhysicalDeviceFragmentShadingRatesKHR(V.pd, &nr, NULL) && nr > 0) {
+                if (nr > 32) nr = 32;
+                memset(raw, 0, nr * sizeof raw[0]);
+                for (uint32_t i = 0; i < nr; i++) raw[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR;
+                if (vk.vkGetPhysicalDeviceFragmentShadingRatesKHR(V.pd, &nr, raw) >= 0 && nr > 0) {
+                    V.vrs_nrates = nr;
+                    for (uint32_t i = 0; i < nr; i++) {
+                        V.vrs_rates[i].samples = raw[i].sampleCounts;
+                        V.vrs_rates[i].w = raw[i].fragmentSize.width <= 255 ? (uint8_t)raw[i].fragmentSize.width : 255;
+                        V.vrs_rates[i].h = raw[i].fragmentSize.height <= 255 ? (uint8_t)raw[i].fragmentSize.height : 255;
+                    }
+                }
+            }
+            if (!V.vrs_nrates) why = "vkGetPhysicalDeviceFragmentShadingRatesKHR returned no rates";
+        }
+        if (!why) {
+            V.vrs = 1; V.vrs_texel_w = 8; V.vrs_texel_h = 8;
+            V.vrs_max_w = pfsr.maxFragmentSize.width ? pfsr.maxFragmentSize.width : 1;
+            V.vrs_max_h = pfsr.maxFragmentSize.height ? pfsr.maxFragmentSize.height : 1;
+            V.vrs_max_samples = pfsr.maxFragmentShadingRateRasterizationSamples ? (uint32_t)pfsr.maxFragmentShadingRateRasterizationSamples : 1;
+            V.vrs_layered = pfsr.layeredShadingRateAttachments != 0;
+            V.vrs_interlock = pfsr.fragmentShadingRateWithFragmentShaderInterlock != 0;
+            VLOG("fragment shading rate (DM_VK_VRS=1): on (texel 8x8, max fragment %ux%u, max samples %u, layered %d, interlock %d, %u driver rates, flip %d)",
+                 V.vrs_max_w, V.vrs_max_h, V.vrs_max_samples, V.vrs_layered, V.vrs_interlock, V.vrs_nrates, V.vrs_flip);
+        } else {
+            VLOG("fragment shading rate (DM_VK_VRS=1): off (%s; texel min %ux%u max %ux%u)", why,
+                 pfsr.minFragmentShadingRateAttachmentTexelSize.width, pfsr.minFragmentShadingRateAttachmentTexelSize.height,
+                 pfsr.maxFragmentShadingRateAttachmentTexelSize.width, pfsr.maxFragmentShadingRateAttachmentTexelSize.height);
+        }
+    }
     vka_enc_install();
     const VkPhysicalDeviceLimits *lim = &V.props.limits;
     V.ub_align = lim->minUniformBufferOffsetAlignment ? lim->minUniformBufferOffsetAlignment : 256; V.sb_align = lim->minStorageBufferOffsetAlignment ? lim->minStorageBufferOffsetAlignment : 256;

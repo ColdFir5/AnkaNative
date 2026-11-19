@@ -50,6 +50,60 @@ int main(void) {
         CHECK(!vka_spv_fout_retype(SPV_TRI_FRAG, fn, 2, 0, &on, err, sizeof err), "a location the module does not write is refused");
         CHECK(!vka_spv_fout_retype(SPV_TRI_FRAG, fn, 1, 1, &on, err, sizeof err), "a location both uint and int is refused");
     }
+    {   // An integer texture read through a float-typed sampled image binding (vka_spv_tex_retype): a small compute module with two bindings sharing one float 2D
+        // OpTypeSampledImage (binding 2: OpImageFetch %v4float + extract + OpBitcast %int; binding 3: OpImageFetch %v4float untouched)
+        static const uint32_t spv_tex[] = {
+            0x07230203u, 0x00010600u, 0x00070000u, 0x00000018u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu, 0x00000000u, 0x00000001u,
+            0x0007000fu, 0x00000005u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00000002u, 0x00000003u, 0x00060010u, 0x00000001u, 0x00000011u,
+            0x00000001u, 0x00000001u, 0x00000001u, 0x00040047u, 0x00000002u, 0x00000022u, 0x00000000u, 0x00040047u, 0x00000002u, 0x00000021u,
+            0x00000002u, 0x00040047u, 0x00000003u, 0x00000022u, 0x00000000u, 0x00040047u, 0x00000003u, 0x00000021u, 0x00000003u, 0x00020013u,
+            0x00000004u, 0x00030021u, 0x00000005u, 0x00000004u, 0x00030016u, 0x00000006u, 0x00000020u, 0x00040017u, 0x00000007u, 0x00000006u,
+            0x00000004u, 0x00040015u, 0x00000008u, 0x00000020u, 0x00000001u, 0x00040017u, 0x00000009u, 0x00000008u, 0x00000002u, 0x0004002bu,
+            0x00000008u, 0x0000000au, 0x00000000u, 0x0005002cu, 0x00000009u, 0x0000000bu, 0x0000000au, 0x0000000au, 0x00090019u, 0x0000000cu,
+            0x00000006u, 0x00000001u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000001u, 0x00000000u, 0x0003001bu, 0x0000000du, 0x0000000cu,
+            0x00040020u, 0x0000000eu, 0x00000000u, 0x0000000du, 0x0004003bu, 0x0000000eu, 0x00000002u, 0x00000000u, 0x0004003bu, 0x0000000eu,
+            0x00000003u, 0x00000000u, 0x00050036u, 0x00000004u, 0x00000001u, 0x00000000u, 0x00000005u, 0x000200f8u, 0x0000000fu, 0x0004003du,
+            0x0000000du, 0x00000010u, 0x00000002u, 0x00040064u, 0x0000000cu, 0x00000011u, 0x00000010u, 0x0007005fu, 0x00000007u, 0x00000012u,
+            0x00000011u, 0x0000000bu, 0x00000002u, 0x0000000au, 0x00050051u, 0x00000006u, 0x00000013u, 0x00000012u, 0x00000000u, 0x0004007cu,
+            0x00000008u, 0x00000014u, 0x00000013u, 0x0004003du, 0x0000000du, 0x00000015u, 0x00000003u, 0x00040064u, 0x0000000cu, 0x00000016u,
+            0x00000015u, 0x0007005fu, 0x00000007u, 0x00000017u, 0x00000016u, 0x0000000bu, 0x00000002u, 0x0000000au, 0x000100fdu, 0x00010038u,
+        };
+        size_t tn = sizeof spv_tex / 4;
+        uint32_t *tu = vka_spv_tex_retype(spv_tex, tn, 1ull << 2, 0, &on, err, sizeof err);
+        CHECK(tu, "compute texture binding 2 not retyped to uint: %s", err);
+        if (tu) {
+            CHECK(tu[3] > spv_tex[3], "tex retype bound grows (%u -> %u)", spv_tex[3], tu[3]);
+            CHECK(count_op(tu, on, 124) == count_op(spv_tex, tn, 124) + 1, "one bitcast added (binding 2 only)");
+            uint32_t u32 = 0, v4u = 0; int saw_f2 = 0, saw_f3 = 0;
+            for (size_t i = 5; i < on;) {
+                uint32_t op = tu[i] & 0xffff, len = tu[i] >> 16; if (!len) break;
+                if (op == 21 && len >= 4 && tu[i + 2] == 32 && tu[i + 3] == 0) u32 = tu[i + 1];
+                else if (op == 23 && len >= 4 && tu[i + 2] == u32 && u32 && tu[i + 3] == 4) v4u = tu[i + 1];
+                else if (op == 95 && len >= 5) {
+                    if (tu[i + 3] == 0x11) {   // binding 2 fetch -> %v4uint, followed by OpBitcast %v4float %18 %tmp
+                        size_t j = i + len;
+                        saw_f2 = v4u && tu[i + 1] == v4u && j + 4 <= on && (tu[j] & 0xffff) == 124 && tu[j + 1] == 7 && tu[j + 2] == 0x12 && tu[j + 3] == tu[i + 2];
+                    } else if (tu[i + 3] == 0x16) {   // binding 3 fetch -> untouched %v4float %23
+                        saw_f3 = tu[i + 1] == 7 && tu[i + 2] == 0x17;
+                    }
+                }
+                i += len;
+            }
+            CHECK(saw_f2, "binding 2 OpImageFetch is now %%v4uint followed by OpBitcast to %%v4float");
+            CHECK(saw_f3, "binding 3 OpImageFetch is untouched (%%v4float)");
+            if (val) CHECK(validate(tu, on, "compute tex retype (uint)"), "valid SPIR-V");
+            free(tu);
+        }
+        uint32_t *ts = vka_spv_tex_retype(spv_tex, tn, 0, 1ull << 2, &on, err, sizeof err);
+        CHECK(ts, "compute texture binding 2 not retyped to int: %s", err);
+        if (ts) {
+            if (val) CHECK(validate(ts, on, "compute tex retype (int)"), "valid SPIR-V");
+            free(ts);
+        }
+        CHECK(!vka_spv_tex_retype(spv_tex, tn, 1ull << 4, 0, &on, err, sizeof err), "a binding not in the module is refused");
+        CHECK(!vka_spv_tex_retype(spv_tex, tn, 1ull << 2, 1ull << 2, &on, err, sizeof err), "a binding both uint and int is refused");
+        CHECK(!vka_spv_tex_retype(spv_tex, tn, 0, 0, &on, err, sizeof err), "empty masks are refused");
+    }
     const char *dir = getenv("DM_VK_SPV_DIR");
     if (dir) {
         DIR *d = opendir(dir); struct dirent *e; int done = 0, refused = 0;

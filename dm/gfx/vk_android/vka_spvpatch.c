@@ -834,3 +834,233 @@ fail:
     return NULL;
 #undef FAIL
 }
+
+// vka_spv_tex_retype: integer textures read through float-typed sampled image bindings. On Maxwell / Ampere a TEX / TLD instruction puts the texel's integer bits
+// (zero-extended for UINT, sign-extended for SINT) into the 32-bit result registers whatever type the shader declares, and a shader that wants those bits bit-casts the
+// float vector to integer (Ocarina of Time's SMAA edge pass d17eefaff4f0bc23 reads its R16G16_UINT edge texture at binding 2 via OpImageFetch %v4float then OpBitcast
+// to int). Vulkan forbids binding an integer image view to a float-typed sampled image, so the replay leaves it unbound and the pass reads zeros. For each set 0
+// UniformConstant image / sampled-image variable at a binding in umask (uint) or smask (int), give it a new integer-sampled image type (and matching sampled-image and
+// pointer types), carry the new types through OpLoad / OpImage / OpSampledImage / OpCopyObject, and retype each read (OpImageFetch, OpImageRead, OpImageGather,
+// OpImageSample*, OpImageSparse*) to the integer vector followed by an OpBitcast back to the original float result type under the original result id
+enum { SCUniformConstant = 0, OpTypeImage = 25, OpTypeSampledImage = 27, OpCompositeExtract = 81, OpSampledImage = 86,
+       OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleProjImplicitLod = 91, OpImageSampleProjExplicitLod = 92,
+       OpImageFetch = 95, OpImageGather = 96, OpImageRead = 98, OpImage = 100,
+       OpImageQueryFormat = 101, OpImageQueryOrder = 102, OpImageQuerySizeLod = 103, OpImageQuerySize = 104,
+       OpImageQueryLod = 105, OpImageQueryLevels = 106, OpImageQuerySamples = 107,
+       OpImageSparseSampleImplicitLod = 305, OpImageSparseSampleExplicitLod = 306, OpImageSparseSampleProjImplicitLod = 309, OpImageSparseSampleProjExplicitLod = 310,
+       OpImageSparseFetch = 313, OpImageSparseGather = 314, OpImageSparseRead = 320 };
+static int is_tex_read(uint32_t op) {
+    return op == OpImageSampleImplicitLod || op == OpImageSampleExplicitLod || op == OpImageSampleProjImplicitLod || op == OpImageSampleProjExplicitLod ||
+           op == OpImageFetch || op == OpImageGather || op == OpImageRead;
+}
+static int is_tex_sparse(uint32_t op) {
+    return op == OpImageSparseSampleImplicitLod || op == OpImageSparseSampleExplicitLod || op == OpImageSparseSampleProjImplicitLod || op == OpImageSparseSampleProjExplicitLod ||
+           op == OpImageSparseFetch || op == OpImageSparseGather || op == OpImageSparseRead;
+}
+static int is_tex_query(uint32_t op) { return op >= OpImageQueryFormat && op <= OpImageQuerySamples; }
+// Non-literal ID operands of an instruction in a function body: 1 if any references a retyped id (with *bad set to it). Skips literal operand positions
+// (Image Operands masks, VectorShuffle / CompositeExtract indices, Memory Access masks, merge controls, ExtInst opcode) so a small retyped variable id (e.g. %2)
+// is not mistaken for a literal like Lod (2)
+static int tex_uses_retyped(const uint32_t *in, uint32_t op, uint32_t len, uint32_t bound, const uint8_t *kind, uint32_t *bad) {
+#define CHK(k) do { if ((k) < len && in[k] < bound && kind[in[k]]) { *bad = in[k]; return 1; } } while (0)
+    switch (op) {
+    case OpName: case OpMemberName: case OpEntryPoint: case OpDecorate: case OpMemberDecorate: case OpDecorateId: case OpDecorateString: case OpMemberDecorateString:
+    case OpLabel: case OpBranch: case OpBranchConditional: case OpSwitch: case OpSelectionMerge: case OpLoopMerge:
+        return 0;
+    case OpLoad: case 81 /* OpCompositeExtract */: CHK(3); return 0;
+    case OpStore: CHK(1); CHK(2); return 0;
+    case 79 /* OpVectorShuffle */: case 82 /* OpCompositeInsert */: CHK(3); CHK(4); return 0;
+    case OpImageWrite: CHK(1); return 0;
+    case 89: case 90: case 93: case 94: case 97: case 307: case 308: case 311: case 312: case 315:   // Dref image ops
+        CHK(3); return 0;
+    }
+    if (is_tex_read(op) || is_tex_sparse(op) || is_tex_query(op)) { CHK(3); return 0; }
+    for (uint32_t k = 1; k < len; k++) if (!(op == OpExtInst && k == 4)) CHK(k);
+    return 0;
+#undef CHK
+}
+uint32_t *vka_spv_tex_retype(const uint32_t *w, size_t nw, uint64_t umask, uint64_t smask, size_t *out_nw, char *err, size_t errn) {
+#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
+    uint32_t *dset = NULL, *bind = NULL, *img_at = NULL, *si_img = NULL, *ptee = NULL;
+    uint8_t *kind = NULL, *pidx = NULL; vec_t o = {0};
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    uint32_t bound = w[3];
+    if ((umask | smask) == 0 || (umask & smask)) { snprintf(err, errn, "no binding, or a binding both uint and int"); return NULL; }
+    if (!(dset = malloc((size_t)bound * 4)) || !(bind = malloc((size_t)bound * 4)) || !(img_at = calloc(bound, 4)) || !(si_img = calloc(bound, 4)) ||
+        !(ptee = calloc(bound, 4)) || !(kind = calloc(bound, 1)) || !(pidx = calloc(bound, 1)))
+        FAIL("out of memory");
+    for (uint32_t i = 0; i < bound; i++) dset[i] = bind[i] = ~0u;
+    uint32_t t_f32 = 0, t_v4f = 0, t_int[2] = {0}, t_v4[2] = {0};
+    size_t first_fn = nw; int has_sparse = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) FAIL("bad instruction at word %zu", i);
+        if (op == OpDecorate && len >= 4 && w[i + 1] < bound) {
+            if (w[i + 2] == DecDescriptorSet) dset[w[i + 1]] = w[i + 3];
+            else if (w[i + 2] == DecBinding) bind[w[i + 1]] = w[i + 3];
+        } else if (op == OpTypeFloat && len >= 3 && w[i + 2] == 32) t_f32 = w[i + 1];
+        else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32) t_int[w[i + 3] ? 1 : 0] = w[i + 1];
+        else if (op == OpTypeVector && len >= 4 && w[i + 3] == 4) {
+            if (w[i + 2] == t_f32 && t_f32) t_v4f = w[i + 1];
+            else if (w[i + 2] == t_int[0] && t_int[0]) t_v4[0] = w[i + 1];
+            else if (w[i + 2] == t_int[1] && t_int[1]) t_v4[1] = w[i + 1];
+        } else if (op == OpTypeImage && len >= 9 && w[i + 1] < bound) img_at[w[i + 1]] = (uint32_t)i;
+        else if (op == OpTypeSampledImage && len >= 3 && w[i + 1] < bound) si_img[w[i + 1]] = w[i + 2];
+        else if (op == OpTypePointer && len >= 4 && w[i + 2] == SCUniformConstant && w[i + 1] < bound) ptee[w[i + 1]] = w[i + 3];
+        else if (op == OpFunction && first_fn == nw) first_fn = i;
+        else if (is_tex_sparse(op)) has_sparse = 1;
+        i += len;
+    }
+    if (!t_f32) FAIL("no 32-bit float type");
+    // The UniformConstant image / sampled-image variables at set 0 bindings of umask / smask
+    struct { uint32_t orig_img, orig_at, new_img, new_si, new_ptr_img, new_ptr_si; int c, need_img, need_si; } pairs[64];
+    int npairs = 0; uint32_t moved[64]; int nmoved = 0, need_c[2] = {0}; uint64_t found = 0;
+    for (size_t i = 5; i < first_fn;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OpVariable && len >= 4 && w[i + 3] == SCUniformConstant && w[i + 1] < bound && w[i + 2] < bound) {
+            uint32_t id = w[i + 2], b = bind[id];
+            if (dset[id] == 0 && b < 64 && (((umask | smask) >> b) & 1)) {
+                if (len > 4) FAIL("binding %u has an initializer", b);
+                uint32_t pt = ptee[w[i + 1]], orig_img = 0; int is_si = 0;
+                if (pt < bound && si_img[pt]) { is_si = 1; orig_img = si_img[pt]; }
+                else if (pt < bound && img_at[pt]) { is_si = 0; orig_img = pt; }
+                else FAIL("binding %u is not an image or sampled-image variable", b);
+                if (orig_img >= bound || !img_at[orig_img]) FAIL("binding %u has no OpTypeImage", b);
+                uint32_t at = img_at[orig_img];
+                if (w[at + 2] != t_f32) FAIL("binding %u is not float-sampled", b);
+                if (w[at + 4] == 1) FAIL("binding %u is a depth image", b);
+                if (w[at + 7] != 1) FAIL("binding %u is not a sampled image (Sampled=%u)", b, w[at + 7]);
+                if (nmoved == 64) FAIL("too many bindings");
+                int c = ((umask >> b) & 1) ? 0 : 1, pi = 0;
+                while (pi < npairs && !(pairs[pi].orig_img == orig_img && pairs[pi].c == c)) pi++;
+                if (pi == npairs) { memset(&pairs[pi], 0, sizeof pairs[pi]); pairs[pi].orig_img = orig_img; pairs[pi].orig_at = at; pairs[pi].c = c; npairs++; }
+                if (is_si) pairs[pi].need_si = 1; else pairs[pi].need_img = 1;
+                kind[id] = is_si ? 2 : 1; pidx[id] = (uint8_t)pi; moved[nmoved++] = id; found |= 1ull << b; need_c[c] = 1;
+            }
+        }
+        i += len;
+    }
+    if (found != (umask | smask)) FAIL("bindings %#llx are not float sampled-image UniformConstant variables in set 0", (unsigned long long)((umask | smask) & ~found));
+    // Allocate new ids for missing scalar/vector integer types, retyped image/sampled-image/pointer types, and any sparse residency structs
+    uint32_t nb = bound, mk_int[2] = {0}, mk_v4[2] = {0};
+    for (int c = 0; c < 2; c++) if (need_c[c]) {
+        if (!t_int[c]) t_int[c] = mk_int[c] = nb++;
+        if (!t_v4[c]) t_v4[c] = mk_v4[c] = nb++;
+    }
+    for (int p = 0; p < npairs; p++) {
+        pairs[p].new_img = nb++; pairs[p].new_si = nb++;
+        if (pairs[p].need_img) pairs[p].new_ptr_img = nb++;
+        if (pairs[p].need_si) pairs[p].new_ptr_si = nb++;
+    }
+    struct { uint32_t orig, m0, nid; int c; } sp_st[16]; int nsp_st = 0;
+    if (has_sparse && t_v4f) {
+        for (size_t i = 5; i < first_fn;) {
+            uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+            if (op == OpTypeStruct && len == 4 && w[i + 3] == t_v4f)
+                for (int c = 0; c < 2; c++) if (need_c[c] && nsp_st < 16) { sp_st[nsp_st].orig = w[i + 1]; sp_st[nsp_st].m0 = w[i + 2]; sp_st[nsp_st].c = c; sp_st[nsp_st].nid = nb++; nsp_st++; }
+            i += len;
+        }
+    }
+    // Pass 2: copy, retyping. New types and moved variables go right before the first function, as in vka_spv_vin_retype / vka_spv_fout_retype
+    if (!put_n(&o, w, 5)) FAIL("out of memory");
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
+        if (i == first_fn) {
+            for (int c = 0; c < 2; c++) if (need_c[c]) {
+                if (mk_int[c]) { uint32_t x[4] = {4u << 16 | OpTypeInt, mk_int[c], 32, (uint32_t)c}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
+                if (mk_v4[c]) { uint32_t x[4] = {4u << 16 | OpTypeVector, mk_v4[c], t_int[c], 4}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
+            }
+            for (int p = 0; p < npairs; p++) {
+                uint32_t ilen = w[pairs[p].orig_at] >> 16;
+                if (!put_n(&o, w + pairs[p].orig_at, ilen)) FAIL("out of memory");
+                o.w[o.n - ilen + 1] = pairs[p].new_img; o.w[o.n - ilen + 2] = t_int[pairs[p].c];
+                uint32_t si[3] = {3u << 16 | OpTypeSampledImage, pairs[p].new_si, pairs[p].new_img};
+                if (!put_n(&o, si, 3)) FAIL("out of memory");
+                if (pairs[p].new_ptr_img) { uint32_t x[4] = {4u << 16 | OpTypePointer, pairs[p].new_ptr_img, SCUniformConstant, pairs[p].new_img}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
+                if (pairs[p].new_ptr_si) { uint32_t x[4] = {4u << 16 | OpTypePointer, pairs[p].new_ptr_si, SCUniformConstant, pairs[p].new_si}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
+            }
+            for (int k = 0; k < nsp_st; k++) { uint32_t x[4] = {4u << 16 | OpTypeStruct, sp_st[k].nid, sp_st[k].m0, t_v4[sp_st[k].c]}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
+            for (int k = 0; k < nmoved; k++) {
+                uint32_t id = moved[k], pi = pidx[id];
+                uint32_t x[4] = {4u << 16 | OpVariable, kind[id] == 2 ? pairs[pi].new_ptr_si : pairs[pi].new_ptr_img, id, SCUniformConstant};
+                if (!put_n(&o, x, 4)) FAIL("out of memory");
+            }
+        }
+        if (op == OpVariable && len >= 4 && w[i + 2] < bound && kind[w[i + 2]] && i < first_fn) { i += len; continue; }   // re-emitted above
+        if (i >= first_fn) {
+            if (op == OpLoad && len >= 4 && w[i + 3] < bound && (kind[w[i + 3]] == 1 || kind[w[i + 3]] == 2)) {
+                uint32_t r = w[i + 2], k = kind[w[i + 3]], pi = pidx[w[i + 3]];
+                if (r >= bound) FAIL("bad id");
+                kind[r] = (uint8_t)(k + 2); pidx[r] = (uint8_t)pi;
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                o.w[o.n - len + 1] = k == 2 ? pairs[pi].new_si : pairs[pi].new_img;
+                i += len; continue;
+            }
+            if (op == OpImage && len == 4 && w[i + 3] < bound && kind[w[i + 3]] == 4) {
+                uint32_t r = w[i + 2], pi = pidx[w[i + 3]];
+                if (r >= bound) FAIL("bad id");
+                kind[r] = 3; pidx[r] = (uint8_t)pi;
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                o.w[o.n - len + 1] = pairs[pi].new_img;
+                i += len; continue;
+            }
+            if (op == OpSampledImage && len == 5 && w[i + 3] < bound && kind[w[i + 3]] == 3) {
+                uint32_t r = w[i + 2], pi = pidx[w[i + 3]];
+                if (r >= bound) FAIL("bad id");
+                kind[r] = 4; pidx[r] = (uint8_t)pi;
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                o.w[o.n - len + 1] = pairs[pi].new_si;
+                i += len; continue;
+            }
+            if (op == OpCopyObject && len == 4 && w[i + 3] < bound && kind[w[i + 3]]) {
+                uint32_t r = w[i + 2], k = kind[w[i + 3]], pi = pidx[w[i + 3]];
+                if (r >= bound) FAIL("bad id");
+                kind[r] = (uint8_t)k; pidx[r] = (uint8_t)pi;
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                o.w[o.n - len + 1] = k == 1 ? pairs[pi].new_ptr_img : k == 2 ? pairs[pi].new_ptr_si : k == 3 ? pairs[pi].new_img : pairs[pi].new_si;
+                i += len; continue;
+            }
+            if (is_tex_read(op) && len >= 5 && w[i + 3] < bound && (kind[w[i + 3]] == 3 || kind[w[i + 3]] == 4)) {
+                uint32_t ft = w[i + 1], r = w[i + 2], pi = pidx[w[i + 3]]; int c = pairs[pi].c;
+                uint32_t it = (ft == t_v4f && t_v4f) ? t_v4[c] : (op == OpImageRead && ft == t_f32) ? t_int[c] : 0;
+                if (!it) FAIL("image read opcode %u has unexpected result type %u", op, ft);
+                uint32_t tmp = nb++;
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                o.w[o.n - len + 1] = it; o.w[o.n - len + 2] = tmp;
+                uint32_t bc[4] = {4u << 16 | OpBitcast, ft, r, tmp};
+                if (!put_n(&o, bc, 4)) FAIL("out of memory");
+                i += len; continue;
+            }
+            if (is_tex_sparse(op) && len >= 5 && w[i + 3] < bound && (kind[w[i + 3]] == 3 || kind[w[i + 3]] == 4)) {
+                uint32_t ft = w[i + 1], r = w[i + 2], pi = pidx[w[i + 3]]; int c = pairs[pi].c;
+                uint32_t nst = 0, m0 = 0;
+                for (int k = 0; k < nsp_st; k++) if (sp_st[k].orig == ft && sp_st[k].c == c) { nst = sp_st[k].nid; m0 = sp_st[k].m0; break; }
+                if (!nst) FAIL("sparse image read opcode %u has unexpected result struct %u", op, ft);
+                uint32_t tmp = nb++, rc = nb++, tx = nb++, ftx = nb++;
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                o.w[o.n - len + 1] = nst; o.w[o.n - len + 2] = tmp;
+                uint32_t fix[] = {5u << 16 | OpCompositeExtract, m0, rc, tmp, 0,
+                                  5u << 16 | OpCompositeExtract, t_v4[c], tx, tmp, 1,
+                                  4u << 16 | OpBitcast, t_v4f, ftx, tx,
+                                  5u << 16 | OpCompositeConstruct, ft, r, rc, ftx};
+                if (!put_n(&o, fix, sizeof fix / 4)) FAIL("out of memory");
+                i += len; continue;
+            }
+            if (is_tex_query(op) && len >= 4 && w[i + 3] < bound && (kind[w[i + 3]] == 3 || kind[w[i + 3]] == 4)) {
+                if (!put_n(&o, in, len)) FAIL("out of memory");
+                i += len; continue;
+            }
+            uint32_t bad_id = 0;
+            if (tex_uses_retyped(in, op, len, bound, kind, &bad_id)) FAIL("opcode %u uses a retyped image (id %u)", op, bad_id);
+        }
+        if (!put_n(&o, in, len)) FAIL("out of memory");
+        i += len;
+    }
+    o.w[3] = nb;
+    free(dset); free(bind); free(img_at); free(si_img); free(ptee); free(kind); free(pidx);
+    *out_nw = o.n; return o.w;
+fail:
+    free(dset); free(bind); free(img_at); free(si_img); free(ptee); free(kind); free(pidx); free(o.w);
+    return NULL;
+#undef FAIL
+}

@@ -21,7 +21,7 @@
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) X(vkGetPhysicalDeviceSparseImageFormatProperties) \
     X(vkEnumerateDeviceExtensionProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
     X(vkCreateAndroidSurfaceKHR) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
-    X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
+    X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) X(vkGetPhysicalDeviceFragmentShadingRatesKHR)
 #define VKA_DEVICE_FNS(X) \
     X(vkGetDeviceQueue) X(vkDeviceWaitIdle) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkMapMemory2KHR) X(vkUnmapMemory2KHR) \
@@ -46,6 +46,7 @@
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants) X(vkCmdSetLineWidth) \
     X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) \
+    X(vkCmdSetFragmentShadingRateKHR) \
     X(vkGetPipelineExecutablePropertiesKHR) X(vkGetPipelineExecutableStatisticsKHR)
 #define VKA_MESH_NV_STRIDE 0x494d564eu   // vkCmdDrawMeshTasksIndirectEXT stride for NVN's {count, first} records (V.mesh_nv_ind; our Turnip's tu_mesh.h)
 #define VKA_DECL(f) PFN_##f f;
@@ -107,6 +108,11 @@ typedef struct {
     int sparse_buf;                                 // sparse residency buffers can be made (vka_mem.c span buffers): binding on the queue, buffer residency, strict non-resident reads
     uint64_t tl_queued;                             // the highest timeline value a vkQueueSubmit so far signals (under qmu): what a later submission on the queue may wait for
     int tmp_pipe_stats;                             // TEMP: DM_TMP_PIPE_STATS (VK_KHR_pipeline_executable_properties)
+    // Variable-rate shading (VK_KHR_fragment_shading_rate, DM_VK_VRS=1, restart only; vka_vrs.c)
+    int vrs, vrs_flip, vrs_layered, vrs_interlock;
+    uint32_t vrs_texel_w, vrs_texel_h, vrs_max_w, vrs_max_h, vrs_max_samples;
+    struct { VkSampleCountFlags samples; uint8_t w, h; } vrs_rates[32];
+    uint32_t vrs_nrates;
 } vka_dev;
 extern vka_dev V;
 int tmp_pipe_stats_has(uint64_t key);
@@ -387,12 +393,16 @@ typedef struct vka_shader {
     VkShaderModule mods[5];             // by DMSH_VK_MOD_* variant, made when a pipeline first asks (the base when the shader is made)
     struct vka_vinmod *vin;             // vertex modules with integer-fed inputs retyped, by masks (vka_shader_vin_module)
     struct vka_vinmod *fout;            // pixel modules with float outputs retyped for integer targets, by masks (vka_shader_fout_module)
+    struct vka_texmod *tex;             // compute modules with float-typed sampled texture bindings retyped to uint / int, by masks (vka_shader_tex_module)
+    uint64_t tex_u, tex_s;              // learned set-0 binding masks (0..63) where a float-typed sampled binding met a UINT / SINT texture
+    uint64_t tex_logged, tex_fail;      // bindings logged once / bindings whose retype failed (not retried)
     vka_span c1; VkDeviceSize c1_len;   // the c1 bytes in static memory (none when c1_len is 0)
     int bad;                            // refused: no module, an unknown binding, an NV-only capability (logged once with its key)
     int gs_fx;                          // a geometry shader's memory writes (vka_spv_gs_claim): above 0, its draws bind a claim buffer at VKA_GS_CLAIM_BINDING
     VkShaderModule gs_claim;            // its module with those writes under the per-primitive claim, made when a pipeline first asks
     VkShaderModule frozen[2];           // a task / mesh module with its specialization constants frozen, by GL depth (vka_shader_frozen_module)
     int frozen_none;                    // it has none to freeze, or the rewrite failed (logged): the base module is used
+    uint8_t writes_vp;                  // pre-rasterization module decorates BuiltIn ViewportIndex / ViewportMaskNV (scanned when V.vrs is on)
 } vka_shader;
 typedef struct { vka_shader *sh[VKA_NSTAGE]; unsigned bad; } vka_progsh;   // by NVN stage; bad: stages whose shader is refused (bit = NVN stage) or VKA_BAD_MISSING (their draws are skipped)
 #define VKA_BAD_MISSING (1u << VKA_NSTAGE)   // vka_progsh.bad: a stage's shader is not in the library (its NVN stage unknown)
@@ -411,6 +421,7 @@ VkShaderModule vka_shader_fout_module(vka_shader *s, uint32_t umask, uint32_t sm
 int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask);   // 1 when that module is a rewritten one (not the base module it falls back to)   // the base pixel module with those float outputs as uint / int vectors of their bits (vka_spv_fout_retype), made once per masks
 #define VKA_FS_RETYPE 4                  // vka_gkey.fs_variant beyond the library's pixel DMSH_VK_MOD_* (4 is DMSH_VK_MOD_SHUFFLE_LDS of compute modules, never a pixel variant): the base pixel module with its float outputs at integer attachments retyped (vka_pso.c fout_masks)
 VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t smask);   // the base module with those float inputs as uvec4 / ivec4 (vka_spv_vin_retype), made once per masks   // the module of that variant (DMSH_VK_MOD_*), made on first use; VK_NULL_HANDLE = the entry has none   // the shader of key in library L (the game's, or the selftest's own); NULL = not there or refused
+VkShaderModule vka_shader_tex_module(vka_shader *s, uint64_t umask, uint64_t smask, char *err, size_t errn);   // compute module with float-typed sampled texture bindings at umask / smask retyped to uint / int (vka_spv_tex_retype), cached per masks
 int vka_shlib_check_all(const vka_shlib *L);   // every module and compute pipeline of L made (DM_VK_SHLIB_CHECK=1): the failures
 int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out);   // host-visible memory for the process's life (c1 bytes, the support and zero buffers)
 
@@ -428,11 +439,29 @@ typedef struct { VkPipelineLayout layout; VkDescriptorSetLayout set0; int push; 
 int vka_layout_of(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out);   // the set-0 layout of these stages' records with the pools' set 1
 VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k);
 VkPipeline vka_cs_pipeline(vka_shader *cs, const vka_layout *lay);
+VkPipeline vka_cs_pipeline_retyped(vka_shader *cs, const vka_layout *lay, uint64_t umask, uint64_t smask);
 void vka_pso_save(int force);         // the VkPipelineCache and the prewarm list to the app's files (DM_TEMP): due DM_VK_PCACHE_SAVE_S after the last save, on the saver thread; force = now, on the caller's
 void vka_pso_waits(uint64_t *save_ns, uint64_t *pw_wait_ns);   // cumulative: time saving the cache (saver thread), the frame path's waits for a prewarm thread making the same pipeline
 double vka_gpu_span_ms(uint64_t f);   // frame f's submissions from first part's start to last part's end (vka_exec.c); -1 = not in yet
 
 // ---------- Draws and dispatches (vka_draw.c) ----------
+// Shading-rate image state (NVN2 variable-rate shading: OP_VRS_BIND, OP_VRS_PALETTE, OP_VRS_MODE; vka_vrs.c).
+enum { VKA_VRS_MAX_VP = 16, VKA_VRS_MAX_PAL = 32 };
+enum { VKA_VRS_FB_NONE = 0, VKA_VRS_FB_INTERLOCK, VKA_VRS_FB_VIEWPORT, VKA_VRS_FB_SAMPLES, VKA_VRS_FB_LAYERS, VKA_VRS_FB_AREA, VKA_VRS_FB_NOIMG, VKA_VRS_FB_N };
+typedef struct {
+    int bound;                                        // 1 when a shading-rate texture is bound
+    tex_t tex;                                        // snapshot of bound NVNtexture (valid when bound)
+    int has_view; view_t view;                        // optional NVNtextureView from BindShadingRateImage
+    int palette_mode, palette_mode_set;               // SetShadingRatePaletteMode (0 = default)
+    uint8_t pal_count[VKA_VRS_MAX_VP];                // palette entry count per viewport
+    uint32_t pal[VKA_VRS_MAX_VP][VKA_VRS_MAX_PAL];    // raw palette entries per viewport
+    uint64_t pal0_hash;                               // hash of viewport 0's palette
+    uint64_t gen;                                     // bumped on bind/unbind or vp0 palette change
+} vka_vrs_state;
+uint64_t vka_vrs_pal_hash(int count, const uint32_t *entries);
+VkImageView vka_vrs_prepare(VkCommandBuffer cb, const vka_vrs_state *st, uint32_t rp_w, uint32_t rp_h, uint32_t layers, uint32_t samples, uint32_t *out_w, uint32_t *out_h, int *fb_reason);
+void vka_vrs_note_fallback(int reason);
+
 // The NVN state a queue keeps between submissions, as nvn_mtl.m's S (state_reset gives NVN's defaults)
 typedef struct {
     vka_bstate b;
@@ -443,6 +472,7 @@ typedef struct {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp; uint8_t vp_sw[16][4];
     float blend_color[4], alpha_ref;
     p_prim_restart restart; int rast_discard, tf_on;
+    vka_vrs_state vrs;
     int inited;
 } vka_dstate;
 void vka_dstate_reset(vka_dstate *d);

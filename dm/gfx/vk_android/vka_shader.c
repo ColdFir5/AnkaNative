@@ -256,9 +256,24 @@ static void mesh_store_planes(uint64_t key, const dmsh_vk_entry *e, uint32_t **w
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("mesh shader %016llx: %d output stores sent to per-plane copies of mesh_plane_store", (unsigned long long)key, ch);
     free(*w); *w = o; *nb = on * 4;
 }
-static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, const char **why, char *err, size_t errn) {
+// Scan a pre-rasterization SPIR-V module's decorations for BuiltIn ViewportIndex (41) or ViewportMaskNV (5253), so draws
+// that can select a viewport other than 0 fall back to full-rate shading under DM_VK_VRS=1 (Vulkan has one attachment palette).
+static uint8_t spv_writes_vp(const uint32_t *w, size_t nw) {
+    if (nw < 5 || w[0] != 0x07230203u) return 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffffu, len = w[i] >> 16;
+        if (!len || i + len > nw || op == 54u /* OpFunction */) break;
+        if (op == 71u /* OpDecorate */ && len >= 4 && w[i + 2] == 11u /* BuiltIn */ && (w[i + 3] == 41u || w[i + 3] == 5253u)) return 1;
+        if (op == 72u /* OpMemberDecorate */ && len >= 5 && w[i + 3] == 11u /* BuiltIn */ && (w[i + 4] == 41u || w[i + 4] == 5253u)) return 1;
+        i += len;
+    }
+    return 0;
+}
+static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, uint8_t *out_writes_vp, const char **why, char *err, size_t errn) {
     size_t nb = 0; uint32_t *w = vka_shlib_spirv(L, m, &nb, err, errn);
     if (!w) { *why = err; return VK_NULL_HANDLE; }
+    if (V.vrs && out_writes_vp && e->stage != DMSH_VK_STAGE_FS && e->stage != DMSH_VK_STAGE_CS && e->stage != DMSH_VK_STAGE_TS)
+        *out_writes_vp = spv_writes_vp(w, nb / 4);
     if (e->flags & (DMSH_VK_F_SUBGROUP | DMSH_VK_F_TEXFB)) single_lane(key, e->stage, &w, &nb);
     mesh_index_lanes(key, e, &w, &nb);
     mesh_store_planes(key, e, &w, &nb);
@@ -274,7 +289,7 @@ VkShaderModule vka_shader_module(vka_shader *s, int variant) {
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, variant);
     if (!m) return VK_NULL_HANDLE;
     const char *why = NULL; char err[256];
-    VkShaderModule mod = spv_module(s->lib, s->e, m, s->key, &why, err, sizeof err);
+    VkShaderModule mod = spv_module(s->lib, s->e, m, s->key, NULL, &why, err, sizeof err);
     if (!mod) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("shader %016llx variant %d: %s", (unsigned long long)s->key, variant, why); return VK_NULL_HANDLE; }
     pthread_mutex_lock(&g_mu);
     if (s->mods[variant]) { pthread_mutex_unlock(&g_mu); vk.vkDestroyShaderModule(V.dev, mod, NULL); return s->mods[variant]; }
@@ -397,6 +412,39 @@ int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask) {
     VkShaderModule m = vka_shader_fout_module(s, umask, smask);
     return m && m != vka_shader_module(s, DMSH_VK_MOD_BASE);
 }
+// A compute module with float-typed sampled texture bindings at set 0 umask / smask retyped to uint / int (vka_spvpatch.c vka_spv_tex_retype): made once per pair of masks,
+// kept for the process. Returns VK_NULL_HANDLE on failure (cached so a failing pair is not retried; reason in err if non-NULL)
+struct vka_texmod { struct vka_texmod *next; uint64_t u, s; VkShaderModule mod; };
+VkShaderModule vka_shader_tex_module(vka_shader *s, uint64_t umask, uint64_t smask, char *err, size_t errn) {
+    if (err && errn) err[0] = 0;
+    pthread_mutex_lock(&g_mu);
+    for (struct vka_texmod *v = s->tex; v; v = v->next) if (v->u == umask && v->s == smask) { VkShaderModule m = v->mod; pthread_mutex_unlock(&g_mu); return m; }
+    pthread_mutex_unlock(&g_mu);
+    if (g_shuffle_lds < 0) shuffle_plan();
+    VkShaderModule mod = VK_NULL_HANDLE; char ebuf[256] = "";
+    const dmsh_vk_module *m = g_shuffle_lds ? vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_SHUFFLE_LDS) : NULL;
+    if (!m) m = vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_BASE);
+    size_t nb = 0; uint32_t *w = m ? vka_shlib_spirv(s->lib, m, &nb, ebuf, sizeof ebuf) : NULL;
+    if (w && (s->e->flags & (DMSH_VK_F_SUBGROUP | DMSH_VK_F_TEXFB))) single_lane(s->key, s->e->stage, &w, &nb);
+    size_t on = 0; uint32_t *o = w ? vka_spv_tex_retype(w, nb / 4, umask, smask, &on, ebuf, sizeof ebuf) : NULL;
+    if (o) {
+        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = on * 4, .pCode = o};
+        VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
+        if (r) { snprintf(ebuf, sizeof ebuf, "vkCreateShaderModule %d", r); mod = VK_NULL_HANDLE; }
+    }
+    free(w); free(o);
+    if (!mod && err && errn) snprintf(err, errn, "%s", ebuf[0] ? ebuf : "no base module");
+    pthread_mutex_lock(&g_mu);
+    for (struct vka_texmod *x = s->tex; x; x = x->next) if (x->u == umask && x->s == smask) {
+        VkShaderModule had = x->mod; pthread_mutex_unlock(&g_mu);
+        if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
+        return had;
+    }
+    struct vka_texmod *v = malloc(sizeof *v);
+    if (v) { *v = (struct vka_texmod){s->tex, umask, smask, mod}; s->tex = v; }
+    pthread_mutex_unlock(&g_mu);
+    return mod;
+}
 vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
     pthread_mutex_lock(&g_mu);
     shent *h = sh_find(key, L);
@@ -411,7 +459,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
         why = refusal(L, e);
         const dmsh_vk_module *m = why ? NULL : vka_shlib_module(L, e, DMSH_VK_MOD_BASE);
         if (!why && !m) why = "no base module";
-        if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, &why, err, sizeof err);
+        if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, &s->writes_vp, &why, err, sizeof err);
         if (!why && e->stage == DMSH_VK_STAGE_GS && VKA_ENV("DM_VK_GS_CLAIM", 1)) {   // memory writes: made once per primitive (vka_spv_gs_claim)
             char e2[256] = ""; s->gs_fx = gs_words(s, NULL, NULL, e2, sizeof e2);
             if (s->gs_fx < 0) VRED("geometry shader %016llx: memory writes not put under a claim (%s): drawn as it is, its writes repeated by the device's runs of each primitive", (unsigned long long)key, e2);
